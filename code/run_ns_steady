@@ -1,0 +1,52 @@
+#!/bin/sh -eu
+
+: ${stage=1}
+: ${extra=}
+: ${N=64}
+: ${Re=3200}
+: ${force=0}
+
+e () {
+  echo "$@"
+  eval "$@"
+}
+
+echo "Running stage=${stage}, N=${N}, Re=${Re}"
+
+cmd="./ns_steady.py --plot_every 10 --frames 10 --linsolver direct --checkpoint_every 50 --N $N --Re $Re --report_every 10"
+
+impextra='--bc 2 --imposed random --kreg 1e-4 --plot_every 30 --frames 2'
+extra="$extra $@"
+
+if [ $stage = "0" ] ; then
+  e $cmd $extra
+elif [ $stage = "1" ] ; then
+  # Lid-driven cavity: direct problem with reference from *.pickle.
+  e $cmd --ref_path ref_cavity/cavity_N${N}_Re${Re}.pickle $extra
+elif [ $stage = "1g" ] ; then
+  # Lid-driven cavity: generate reference data *.pickle.
+  out="ref_cavity/cavity_N${N}_Re${Re}"
+  outdir="cavity_N${N}_Re${Re}"
+  [ ! "$force" = 1 ] && [ -f "$out.pickle" ] && echo "skip existing '$out'" && exit 0
+  e $cmd --ref_path ref_cavity/cavity_N${N}_Re${Re}.pickle --outdir $outdir $extra
+  e cp "$(ls $outdir/state_*.pickle | tail -n 1)" "$out.pickle"
+  e cp "$outdir/train.log" "$out.log"
+  e cp "$outdir/args.json" "$out.json"
+  e cp "$(ls $outdir/all_*.jpg | tail -n 1)" "$out.jpg"
+  e rm -r $outdir
+elif [ $stage = "3" ] ; then
+  e $cmd --Re $Re --plot_every 200 --report_every 100 --optimizer lbfgsb $extra
+elif [ $stage = "4" ] ; then
+  # Lid-driven cavity from sparse points.
+  e $cmd $impextra --ref_path ref_cavity/cavity_N${N}_Re${Re}.pickle --nimp 60 $extra
+elif [ $stage = "5" ] ; then
+  e $cmd $impextra --ref_path uniform --nimp 1 $extra
+elif [ $stage = "6" ] ; then
+  # Uniform or Couette flow from from sparse points.
+  e $cmd $impextra --ref_path couette --nimp 3 $extra
+elif [ $stage = "7" ] ; then
+  e $cmd $impextra --ref_path pois --nimp 8 $extra
+else
+  echo "Unknown stage=$stage"
+  exit 1
+fi

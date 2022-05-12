@@ -1,0 +1,36 @@
+#!/bin/sh -eu
+
+e () {
+  echo "$@"
+  eval "$@"
+}
+
+: ${name=blob}
+: ${N=64}
+: ${extra=}
+: ${force=0}
+
+out="N${N}"
+outdir="data_$out"
+
+if [ ! "$force" = 1 ] &&  [ -d "$outdir" ] ; then
+  last="$(ls $outdir/state_*.pickle | tail -n 1)"
+  if [ -f "$last" ] ; then
+    echo "Restarting from state '$last'"
+    extra="$extra --load_fields '$last'"
+  fi
+fi
+
+extra="$extra $@"
+
+echo "Output directory '$outdir'"
+
+cmd="./advection_2d.py --Nt $N --Nx $N --Ny $N --frames 50 --onlyfinal 1 --plot_every 10 --report_every 1 --history_every 1 --ktreg 1 --kreg 1e-3 --linsolver multigrid --linsolver_maxiter 25 --periodic 0 --quiverref 0 --outdir $outdir"
+
+if [ -f "$out.pdf" ] && [ ! "$force" = "1" ] ; then
+  echo "skip existing '$out.pdf'"
+  exit
+fi
+
+e $cmd --ref_path ${name} --problem inverse $extra
+e cp "$(ls $outdir/quv_*.pdf | tail -n 1)" "$out.pdf"

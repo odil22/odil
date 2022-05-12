@@ -1,0 +1,18 @@
+#!/bin/sh -eu
+
+
+if [ "${minimal:-0}" = "1" ] ; then
+  extra="--seeds 1 --nimp_min 10 --nimp_max 31 --nimp_skip 20 --epochs 2 --plot_every 5"
+  for d in vary_*/ ; do
+    echo "$d"
+    (cd "$d" && mpirun ./run $extra)
+  done
+else
+  for d in vary_*/ ; do
+    (cd "$d" && mpirun ./run)
+  done
+fi
+
+./load_data_all
+./plot_all
+./copy_plots

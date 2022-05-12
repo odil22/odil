@@ -1,0 +1,17 @@
+metadata_version: 1
+name: ODIL
+description: Optimizing a DIscrete Loss (ODIL) to solve forward and inverse problems
+  for partial differential equations using machine learning tools
+tags:
+- partial-differential-equations
+- inverse-problems
+- simulation
+- python
+- tensorflow
+authors:
+- name: Anonymous
+  affiliations:
+  - name: Anonymous
+corresponding_contributor:
+  name: Anonymous
+  email: odil22@protonmail.com

@@ -1,0 +1,58 @@
+#!/bin/sh -eu
+
+: ${stage=2}
+: ${extra=}
+: ${N=128}
+: ${Re=3200}
+: ${force=0}
+: ${nimp=32}
+: ${niter=10}
+
+e () {
+  echo "$@"
+  eval "$@"
+}
+
+echo "Running stage=${stage}, N=${N}, Re=${Re}"
+
+
+cmd="./ns_steady.py --plot_every $niter --frames 2 --optimizer newton --linsolver direct --checkpoint_every $niter --N $N --Re $Re --report_every 10 --plot_stream 1"
+
+refpath="cavity_N${N}_Re${Re}.pickle"
+
+if [ $stage = "1" ] ; then
+  # Lid-driven cavity: generate reference data *.pickle.
+  out="cavity_N${N}_Re${Re}"
+  [ ! "$force" = 1 ] && [ -f "$refpath" ] && echo "skip existing '$out.pickle'" && exit 0
+  datadir="data_$out"
+  e $cmd --outdir '$datadir' $extra
+  e cp "$(ls $datadir/state_*.pickle | tail -n 1)" "$refpath"
+  e cp "$datadir/train.log" "$out.log"
+  e cp "$datadir/args.json" "$out.json"
+  e cp "$(ls $datadir/all_*.jpg | tail -n 1)" "$out.jpg"
+elif [ $stage = "2" ] ; then
+  # Lid-driven cavity from sparse points.
+  out="cavity_N${N}_Re${Re}_reconst${nimp}"
+  [ ! "$force" = 1 ] && [ -f "${out}_u.pdf" ] && echo "skip existing '${out}_u.pdf'" && exit 0
+  reusedat=0
+  if [ ! "$force" = 1 ] && [ -f "$out.pickle" ] ; then
+    echo "Loading existing data '$out.pickle'"
+    extra="$extra --load_fields '$out.pickle' --frames 1 --epochs 0"
+    reusedat=1
+  fi
+  datadir="data_$out"
+  e $cmd  --outdir '$datadir' --bc 1 --imposed random --nimp $nimp --kreg 1e-4 --ref_path "$refpath" $extra
+  e cp "$(ls $datadir/u_*.pdf | tail -n 1)" "${out}_u.pdf"
+  e cp "$(ls $datadir/v_*.pdf | tail -n 1)" "${out}_v.pdf"
+  e cp "$(ls $datadir/p_*.pdf | tail -n 1)" "${out}_p.pdf"
+  e cp "$(ls $datadir/psi_*.pdf | tail -n 1)" "${out}_psi.pdf"
+  if [ "$reusedat" = "0" ] ; then
+    e cp "$(ls $datadir/state_*.pickle | tail -n 1)" "$out.pickle"
+    e cp "$datadir/train.log" "$out.log"
+    e cp "$datadir/args.json" "$out.json"
+  fi
+else
+  echo "Unknown stage=$stage"
+  exit 1
+fi
+[ -d "$datadir" ] && rm -r "$datadir"

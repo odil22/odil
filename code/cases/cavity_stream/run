@@ -1,0 +1,37 @@
+#!/bin/sh -eu
+
+# Plots streamlines for lid-driven cavity.
+
+: ${extra=}
+: ${N=128}
+: ${Re=3200}
+: ${niter=20}
+: ${force=0}
+
+e () {
+  echo "$@"
+  eval "$@"
+}
+
+echo "Running N=${N}, Re=${Re}"
+
+out="cavity_N${N}_Re${Re}"
+datadir="data_$out"
+
+cmd="./ns_steady.py --plot_every $niter --frames 1 --optimizer newton --linsolver direct --checkpoint_every $niter --N $N --Re $Re --report_every 1 --plot_stream 1 --outdir '$datadir'"
+
+[ ! "$force" = 1 ] && [ -f "$out.pdf" ] && echo "skip existing '$out.pdf'" && exit 0
+reusedat=0
+if [ ! "$force" = 1 ] && [ -f "$out.pickle" ] ; then
+  echo "Loading existing data '$out.pickle'"
+  extra="$extra --load_fields '$out.pickle' --frames 0"
+  reusedat=1
+fi
+e $cmd $extra
+e cp "$(ls $datadir/psi_*.pdf | tail -n 1)" "$out.pdf"
+if [ "$reusedat" = "0" ] ; then
+  e cp "$(ls $datadir/state_*.pickle | tail -n 1)" "$out.pickle"
+  e cp "$datadir/train.log" "$out.log"
+  e cp "$datadir/args.json" "$out.json"
+fi
+[ -d "$datadir" ] && rm -r "$datadir"

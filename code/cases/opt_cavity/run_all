@@ -1,0 +1,17 @@
+#!/bin/sh -eu
+
+if [ "${minimal:-0}" = "1" ] ; then
+  extra="--frames 1 --every_factor 1"
+  export N=32 vRe=100
+  stage=0 ./run $extra
+  stage=1 ./run $extra
+  stage=2 ./run $extra
+  stage=3 ./run $extra
+else
+  stage=0 ./run
+  stage=1 ./run
+  stage=2 ./run
+  stage=3 ./run
+fi
+
+./plot.py

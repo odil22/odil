@@ -1,0 +1,69 @@
+#!/bin/sh -eu
+
+: ${stage=3}
+: ${force=0}
+: ${N=64}
+: ${outdir=data}
+: ${vRe="100 400"}
+
+e () {
+  echo "$@"
+  eval "$@"
+}
+
+mkdir -p "$outdir"
+
+cmd="./ns_steady.py --plot_every 10 --frames 10 --linsolver direct --checkpoint_every 10 --report_every 10"
+
+rungen () {
+  out="cavity_N${N}_Re${Re}"
+  tmpdir="cavity_N${N}_Re${Re}"
+  [ ! "$force" = 1 ] && [ -f "$out.pickle" ] && echo "skip existing '$out'" && exit 0
+  e $cmd --outdir $tmpdir --N $N --Re $Re "$@"
+  e cp "$(ls $tmpdir/state_*.pickle | tail -n 1)" "$out.pickle"
+  e cp "$tmpdir/train.log" "$out.log"
+  e cp "$tmpdir/args.json" "$out.json"
+  e rm -r $tmpdir
+}
+
+runopt () {
+  opt=$1
+  shift 1
+  out="$outdir/cavity_N${N}_Re${Re}_${opt}"
+  tmpdir="data_cavity_N${N}_Re${Re}_${opt}"
+  ref="cavity_N${N}_Re${Re}.pickle"
+  if [ -f "$out.csv" ] && [ ! "$force" = "1" ] ; then
+    echo "skip existing '$out.csv'"
+    return
+  fi
+  e $cmd --optimizer "$opt" --outdir $tmpdir --ref_path $ref --N $N --Re $Re "$@"
+  e cp "$tmpdir/train.csv" "$out.csv"
+  e cp "$tmpdir/train.log" "$out.log"
+  e cp "$tmpdir/args.json" "$out.json"
+  e mkdir -p "$out"
+  e cp $tmpdir/*.pdf "$out/"
+  e rm -rf "$tmpdir"
+}
+
+case $stage in
+  0) echo "Generate reference data."
+  for Re in $vRe ; do
+    rungen "$@"
+  done
+  ;;
+  1) echo "Run with Newton optimizer."
+  for Re in $vRe ; do
+    runopt newton "$@"
+  done
+  ;;
+  2) echo "Run with L-BFGS-B optimizer."
+  for Re in $vRe ; do
+    runopt lbfgsb --every_factor 100 --plot_every 50 "$@"
+  done
+  ;;
+  3) echo "Run with Adam optimizer."
+  for Re in $vRe ; do
+    runopt adam --every_factor 100 --plot_every 50 --lr 0.01 "$@"
+  done
+  ;;
+esac

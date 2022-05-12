@@ -1,0 +1,6 @@
+#!/bin/sh -eu
+
+for d in vary_*/ ; do
+  echo $d
+  (cd $d && ../load_data.py)
+done

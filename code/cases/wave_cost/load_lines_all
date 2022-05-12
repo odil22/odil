@@ -1,0 +1,11 @@
+#!/bin/sh -eu
+
+e () {
+  echo "$@"
+  eval "$@"
+}
+
+for f in */vary.py ; do
+  d=$(dirname "$f")
+  e "(cd $d && ../load_lines.py)"
+done

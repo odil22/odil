@@ -1,0 +1,690 @@
+#!/usr/bin/env python3
+
+import scipy.sparse
+import numpy as np
+import os
+import math
+from util import TIME, TIMECLEAR, Timer
+import pickle
+
+from tfwrap import tf
+
+class Domain:
+    def __init__(
+            self,
+            lower=0.,
+            upper=1.,
+            ndim=None,
+            shape=None,
+            varnames=('x', 'y', 'z'),  # Independent variables.
+            fieldnames=('u', 'v'),  # Unknown fields.
+            neuralnets=dict(),  # Neural networks dict(name:layers)
+            frozen_weights=[],
+            frozen_fields=[],
+            dtype=np.float64):
+        self.ndim = ndim
+        if shape is not None and ndim is not None:
+            assert len(shape) == ndim
+        self.lower = np.ones(ndim, dtype=dtype) * lower
+        self.upper = np.ones(ndim, dtype=dtype) * upper
+        self.varnames = varnames[:ndim]
+        self.fieldnames = fieldnames
+        self.dtype = dtype
+        self.shape = shape
+        self.neuralnets = neuralnets
+        self.frozen_weights = frozen_weights
+        # Names of active weights.
+        self.aweights = [k for k in neuralnets if k not in frozen_weights]
+
+    def fields_size(self):
+        return len(self.fieldnames) * np.prod(self.shape)
+
+    def aweights_size(self):
+        res = 0
+        for name in self.aweights:
+            layers = self.neuralnets[name]
+            for ni, no in zip(layers[:-1], layers[1:]):
+                res += ni * no  # Weights.
+                res += no  # Biases
+        return res
+
+    def weights_size(self):
+        res = 0
+        for layers in self.neuralnets.values():
+            for ni, no in zip(layers[:-1], layers[1:]):
+                res += ni * no  # Weights.
+                res += no  # Biases
+        return res
+
+    def cell_center_1d(self, i):
+        s = self.shape[i]
+        x = np.asarray(self.lower[i] + (np.arange(s) + 0.5) / s *
+                       (self.upper[i] - self.lower[i]),
+                       dtype=self.dtype)
+        return x
+
+    def cell_center_all(self):
+        xx = [self.cell_center_1d(i) for i in range(self.ndim)]
+        res = np.meshgrid(*xx, indexing='ij')
+        return res
+
+    def cell_center_by_dim(self, i):
+        #TODO Only create meshgrid for one component.
+        return self.cell_center_all()[i]
+
+    def cell_center_by_name(self, name):
+        '''
+        Returns cell centers in direction `name` (e.g. 'x').
+        '''
+        if name in self.varnames:
+            i = self.varnames.index(name)
+            return self.cell_center_by_dim(i)
+        return None
+
+    def step_by_dim(self, i):
+        return (self.upper[i] - self.lower[i]) / self.shape[i]
+
+    def cell_index_all(self):
+        return np.meshgrid(*[np.arange(s) for s in self.shape], indexing='ij')
+
+    def cell_index_by_dim(self, i):
+        #TODO Only create meshgrid for one component.
+        return self.cell_index_all()[i]
+
+    def cell_index_by_name(self, name):
+        '''
+        Returns cell index in direction `name` (e.g. 'ix').
+        '''
+        #TODO Only create meshgrid for one component.
+        names = ['i' + n for n in self.varnames]
+        if name in names:
+            i = names.index(name)
+            return self.cell_index_by_dim(i)
+        return None
+
+    def custom_by_name(self, name):
+        if name == "zeros":
+            return tf.zeros(self.shape, dtype=self.dtype)
+        if name == "ones":
+            return tf.ones(self.shape, dtype=self.dtype)
+        return None
+
+    def random_inner(self, size):
+        res = latin_hypercube(self.ndim, size).T
+        for i in range(self.ndim):
+            res[i] = self.lower[i] + (self.upper[i] - self.lower[i]) * res[i]
+        res = [p for p in res]
+        return res
+
+    def random_boundary(self, normal, side, size):
+        '''
+        Returns random points from boundary (domain face).
+        normal: `int`
+            Direction of normal to boundary, [0, ndim)
+        side: `int`
+            Side of boundary (0 or 1).
+        size: `int`
+            Number of samples.
+        '''
+        assert normal < self.ndim
+        assert side == 0 or side == 1
+        res = latin_hypercube(self.ndim - 1, size).T
+        const = np.ones(size) * side
+        res = np.vstack((res[:normal], const, res[normal:]))
+        for i in range(self.ndim):
+            res[i] = self.lower[i] + (self.upper[i] - self.lower[i]) * res[i]
+        res = [p for p in res]
+        return res
+
+    def assign_active_state(self, dst, src):
+        for name in self.fieldnames:
+            dst.fields[name].assign(src.fields[name])
+        for name in self.aweights:
+            for i in range(len(src.weights[name])):
+                dst.weights[name][i].assign(src.weights[name][i])
+
+
+class State:
+    def __init__(self):
+        self.fields = dict()
+        self.weights = dict()
+
+
+def convert_to_tf_variable(domain, state):
+    # Convert to tf.Variable if needed.
+    for name in state.fields:
+        if not isinstance(state.fields[name], tf.Variable):
+            state.fields[name] = tf.Variable(state.fields[name])
+    for name in domain.aweights:
+        if len(state.weights[name]) and \
+                not isinstance(state.weights[name][0], tf.Variable):
+            state.weights[name] = list(map(tf.Variable, state.weights[name]))
+
+
+def eval_neural_net(wb, *uu):
+    '''
+    Evaluates a fully connected neural network.
+    wb: `list`
+        List of weights (rank 2) and biases (rank 1) interleaved.
+    uu: `list`
+        Input arrays. All arrays must have the same shape.
+        The number of arrays `len(uu)` must coincide with the number
+        of inputs of the neural network `wb[0].shape[0]`.
+    Returns:
+        Output array or a list of them if multiple outputs are expected.
+        The output arrays have the same shape as the input arrays.
+        The number of output arrays  conincides with the number of
+        outputs of the neural network `wb[-2].shape[1]`.
+    '''
+
+    ni = wb[0].shape[0]  # Number of inputs.
+    no = wb[-2].shape[1]  # Number of outputs.
+    assert ni == len(uu), \
+            "Got {:} arguments but "\
+            "neural network expects {:} inputs".format(len(uu), ni)
+
+    if ni:  # Neural network with inputs.
+        shape = uu[0].shape
+        n = len(wb) // 2
+        uu = [tf.reshape(u, (-1, )) for u in uu]
+        u = tf.transpose(tf.stack(uu, 0))
+        for i in range(n):
+            w = wb[2 * i]  # Weights.
+            b = wb[2 * i + 1]  # Biases.
+            u = tf.linalg.matmul(u, w) + b[None, :]
+            if i == n - 1:
+                break
+            u = tf.tanh(u)
+        u = tf.transpose(u)
+        uu = tf.reshape(u, (no, ) + shape)
+        uu = [uu[i] for i in range(no)]
+        if no == 1:
+            uu = uu[0]
+        return uu
+    # Neural network without inputs.
+    assert len(wb) == 2 and wb[0].shape[0] == 0 and wb[1].shape != 0, \
+            "Neural network without input can only have biases " \
+            "but has wb={:}".format(wb)
+    return wb[1]
+
+
+class NeuralNet:
+    def __init__(self, weights, *inputs):
+        self.weights = weights
+        self.inputs = [x if tf.is_tensor(x) else tf.constant(x) for x in inputs]
+
+    def __call__(self, *deriv):
+        f = eval_neural_net(self.weights, *self.inputs)
+        assert len(deriv) == 0 or len(deriv) == len(self.inputs)
+        for i in range(len(deriv)):
+            for _ in range(deriv[i]):
+                f = tf.gradients(f, self.inputs[i])[0]
+        return f
+
+
+class Context:
+    def __init__(self,
+                 domain,
+                 args,
+                 field_desc,
+                 state_fields,
+                 state_weights,
+                 epoch=0,
+                 split_shifts=True):
+        '''
+        split_shifts: Treat gradients over shifted fields independently.
+        '''
+        self.domain = domain
+        self.args = args
+        self.field_desc = field_desc
+        self.state_fields = state_fields
+        self.state_weights = state_weights
+        self.split_shifts = split_shifts
+        self.epoch = epoch
+
+    def size(self, i):
+        domain = self.domain
+        if isinstance(i, str):
+            i = domain.varnames.index(i)
+        return domain.shape[i]
+
+    def step(self, i):
+        domain = self.domain
+        if isinstance(i, str):
+            i = domain.varnames.index(i)
+        return domain.step_by_dim(i)
+
+    def cell_index(self, i):
+        domain = self.domain
+        if isinstance(i, str):
+            i = domain.varnames.index(i)
+        return domain.cell_index_by_dim(i)
+
+    def cell_center(self, i):
+        domain = self.domain
+        if isinstance(i, str):
+            i = domain.varnames.index(i)
+        return domain.cell_center_by_dim(i)
+
+    # TODO: Add `shift` parameter to cell_index(), cell_center()
+
+    def neural_net(self, name, *inputs, freeze=False):
+        try:
+            wb = self.state_weights[name]  # Weights and biases interleaved.
+        except KeyError:
+            raise KeyError(
+                "Weights with name '{:}' not found in domain.neuralnets".
+                format(name))
+
+        return NeuralNet(wb, *inputs)
+
+    def field(self, name, *shift, freeze=False):
+        domain = self.domain
+        szero = (0, ) * domain.ndim
+        if len(shift) == 0:
+            shift = szero
+        u = domain.custom_by_name(name)
+        if u is not None:
+            return u
+        try:
+            j = domain.fieldnames.index(name)
+        except ValueError:
+            raise ValueError("Unknown field name '" + name + "'")
+        if self.split_shifts:
+            # New field argument is created for each shift.
+            if freeze:
+                u = tf.roll(self.state_fields[name], np.negative(shift),
+                            range(domain.ndim))
+            elif (j, shift) in self.field_desc:
+                u = self.args[self.field_desc.index((j, shift))]
+            else:
+                u = tf.roll(self.state_fields[name], np.negative(shift),
+                            range(domain.ndim))
+                self.args.append(u)
+                self.field_desc.append((j, shift))
+        else:
+            # One field argument is reused for all shifted fields.
+            if freeze:
+                u = tf.roll(self.state_fields[name], np.negative(shift),
+                            range(domain.ndim))
+            else:
+                if (j, szero) in self.field_desc:
+                    uc = self.args[self.field_desc.index((j, szero))]
+                else:
+                    uc = self.state_fields[name]
+                    self.args.append(uc)
+                    self.field_desc.append((j, szero))
+                u = tf.roll(uc, np.negative(shift), range(domain.ndim))
+        return u
+
+
+class Problem:
+    def __init__(self, operator, domain):
+        '''
+        operator: callable(mod, ctx)
+            Discrete operator returning fields on grid.
+            Each field corresponds to an equation to be solved.
+            Arguments are:
+                mod: module with mathematical functions (tensorflow, numpy)
+                ctx: instance of Context
+        domain: instance of Domain
+        '''
+        self.domain = domain
+        self.operator = operator
+        self.timer_total = Timer()
+        self.timer_last = Timer()
+
+    # XXX _eval_grad() must take members of State explicitly.
+    #     Otherwise, the operator is not computed correctly (possibly frozen).
+    @tf.function
+    def _eval_grad(self, state_fields, state_weights, epoch):
+        domain = self.domain
+        args = []  # Field arguments for which gradients are computed.
+        field_desc = []  # Field descriptors: (i, shift) for `fieldnames[i]`.
+        wargs = [w for name in domain.aweights for w in state_weights[name]]
+        with tf.GradientTape(persistent=True) as tape:
+            ctx = Context(domain,
+                          args,
+                          field_desc,
+                          state_fields,
+                          state_weights,
+                          epoch=epoch,
+                          split_shifts=True)
+            ff = self.operator(tf, ctx)
+            if not isinstance(ff, tuple) and not isinstance(ff, list):
+                ff = (ff, )
+        grads = [tape.gradient(f, args) for f in ff]
+        wgrads = [tape.jacobian(f, wargs) for f in ff]
+        return ff, grads, field_desc, wgrads
+
+    @tf.function
+    def _eval_loss(self, state_fields, state_weights, epoch):
+        domain = self.domain
+        args = []  # Field arguments for which gradients are computed.
+        field_desc = []  # Index in `fieldnames` of the field argument.
+        wargs = [state_weights[name] for name in domain.aweights]
+        with tf.GradientTape(persistent=True,
+                             watch_accessed_variables=True) as tape:
+            ctx = Context(domain,
+                          args,
+                          field_desc,
+                          state_fields,
+                          state_weights,
+                          epoch=epoch,
+                          split_shifts=False)
+            ff = self.operator(tf, ctx)
+            if not isinstance(ff, tuple) and not isinstance(ff, list):
+                ff = (ff, )
+            loss = sum([tf.reduce_mean(tf.square(f)) for f in ff])
+        grads = tape.gradient(loss, args)
+        wgrads = tape.gradient(loss, wargs)
+        return loss, grads, field_desc, wgrads
+
+    def pack_fields(self, fields):
+        res = []
+        for name in self.domain.fieldnames:
+            res.append(np.reshape(fields[name], -1))
+        if res:
+            res = np.hstack(res)
+        return res
+
+    def unpack_fields(self, packed):
+        fields = dict()
+        shape = self.domain.shape
+        i = 0
+        N = np.prod(shape)
+        for name in self.domain.fieldnames:
+            fields[name] = np.reshape(packed[i:i + N], shape)
+            i += N
+        return fields
+
+    def pack_weights(self, weights, with_frozen=False):
+        res = []
+        names = self.domain.neuralnets if with_frozen else self.domain.aweights
+        for name in names:
+            ww = weights[name]
+            layers = self.domain.neuralnets[name]
+            i = 0
+            for ni, no in zip(layers[:-1], layers[1:]):
+                w = ww[i] if ww[i] is not None else np.zeros((ni, no))
+                res.append(np.reshape(w, -1))
+                i += 1
+                w = ww[i] if ww[i] is not None else np.zeros(no)
+                res.append(np.reshape(w, -1))
+                i += 1
+        if res:
+            res = np.hstack(res)
+        return res
+
+    def unpack_weights(self, packed, with_frozen=False):
+        weights = dict()
+        shape = self.domain.shape
+        i = 0
+        names = self.domain.neuralnets if with_frozen else self.domain.aweights
+        for name in names:
+            layers = self.domain.neuralnets[name]
+            ww = []
+            for ni, no in zip(layers[:-1], layers[1:]):
+                # Weights.
+                ww.append(np.reshape(packed[i:i + ni * no], (ni, no)))
+                i += ni * no
+                # Biases.
+                ww.append(packed[i:i + no])
+                i += no
+            weights[name] = ww
+        return weights
+
+    def pack_state(self, state, with_frozen=False):
+        packed = np.hstack((
+            self.pack_fields(state.fields),
+            self.pack_weights(state.weights, with_frozen),
+        ))
+        return packed
+
+    def unpack_state(self, packed, with_frozen=False):
+        state = State()
+        i = 0
+        n = self.domain.fields_size()
+        state.fields = self.unpack_fields(packed[i:i + n])
+        i += n
+        state.weights = self.unpack_weights(packed[i:], with_frozen)
+        return state
+
+    def init_missing(self, state):
+        domain = self.domain
+        for name in domain.fieldnames:
+            if name not in state.fields:
+                # Initialize fields with zeros by defult.
+                state.fields[name] = tf.zeros(domain.shape, dtype=domain.dtype)
+        for name, layers in domain.neuralnets.items():
+            assert layers[-1], \
+                "Neural network '{}' must have output, " \
+                "but has layers={:}".format(name, layers)
+            if name not in state.weights:
+                ww = []
+                for ni, no in zip(layers[:-1], layers[1:]):
+                    # Weights
+                    if ni:
+                        scale = 1 / math.sqrt(ni)
+                        w = tf.random.uniform((ni, no),
+                                              -scale,
+                                              scale,
+                                              dtype=domain.dtype)
+                    else:
+                        w = tf.zeros((ni, no), dtype=domain.dtype)
+                    ww.append(w)
+                    # Biases
+                    ww.append(tf.zeros(no, dtype=domain.dtype))
+                state.weights[name] = ww
+            ww = state.weights[name]
+            if not isinstance(ww, list):
+                raise TypeError("Expected a list of arrays for "
+                                "weights of neural network '{}'".format(name))
+
+        convert_to_tf_variable(domain, state)
+
+    def linearize(self, state, epoch=0):
+        domain = self.domain
+        self.init_missing(state)
+
+        timer = Timer()
+
+        timer.push("eval_grad")
+        epoch = tf.constant(epoch, dtype=domain.dtype)
+        const, grads, field_desc, wgrads = self._eval_grad(
+            state.fields, state.weights, epoch)
+        timer.pop("eval_grad")
+
+        Nu = len(domain.fieldnames)  # Number of unknown fields.
+        N = np.prod(domain.shape)  # Number of cells.
+        Nf = len(const)  # Number of equation fields.
+        mshape = (Nf * N, Nu * N)  # Shape of sparse matrix from fields.
+
+        timer.push("sparse_fields")
+        linear = scipy.sparse.csr_matrix(mshape, dtype=domain.dtype)
+        row = np.arange(N)
+        col_diag = np.reshape(row, domain.shape)
+        for i in range(Nf):  # Loop over equations.
+            for j in range(len(field_desc)):  # Loop over grid field arguments.
+                index, shift = field_desc[j]
+                col = np.roll(col_diag,
+                              shift=np.negative(shift),
+                              axis=range(domain.ndim)).flatten()
+                g = grads[i][j]
+                if g is not None:
+                    g = g.numpy().flatten()
+                    a = scipy.sparse.csr_matrix(
+                        (g, (row + i * N, col + index * N)), shape=mshape)
+                    linear += a
+        timer.pop()
+
+        timer.push("sparse_weights")
+        Nw = domain.aweights_size()  # Size of weights of neural networks.
+        mmw = []  # Matrices with gradients for each equation.
+        for i in range(Nf):  # Loop over equations.
+            ww = wgrads[i]
+            if len(ww) and ww[0] is not None:
+                ww = [tf.reshape(w, domain.shape + (-1, )) for w in ww]
+                mw = tf.concat(ww, axis=domain.ndim)
+                mw = tf.reshape(mw, (N, -1))
+                # Dense matrix with gradients.
+                mw = scipy.sparse.csr_matrix(mw, shape=(N, Nw))
+            else:
+                # Empty matrix.
+                mw = scipy.sparse.csr_matrix((N, Nw), dtype=domain.dtype)
+            mmw.append(mw)
+        mmw = scipy.sparse.vstack(mmw)
+        # Append gradients from weights to gradients from fields.
+        linear = scipy.sparse.hstack((linear, mmw))
+        timer.pop()
+
+        self.timer_total.append(timer)
+        self.timer_last = timer
+
+        return const, linear
+
+    def eval_loss_grad(self, state, epoch=0):
+        domain = self.domain
+        self.init_missing(state)
+
+        timer = Timer()
+
+        epoch = tf.constant(epoch, dtype=domain.dtype)
+        timer.push("eval_grad")
+        loss, raw_grads, field_desc, raw_wgrads = self._eval_loss(
+            state.fields, state.weights, epoch)
+        timer.pop("eval_grad")
+
+        grads = dict()
+        for g, (i, shift) in zip(raw_grads, field_desc):
+            assert shift == (0, ) * domain.ndim
+            grads[domain.fieldnames[i]] = g
+        for name in domain.fieldnames:
+            if name not in grads:
+                grads[name] = np.zeros(domain.shape, dtype=domain.dtype)
+
+        wgrads = dict()
+        for i, name in enumerate(domain.aweights):
+            wgrads[name] = raw_wgrads[i]
+
+        self.timer_total.append(timer)
+        self.timer_last = timer
+
+        return loss, grads, wgrads
+
+
+def checkpoint_save(state, path):
+    s = dict()
+    fields = dict()
+    for k in state.fields:
+        fields[k] = np.array(state.fields[k])
+    s['fields'] = fields
+
+    weights = dict()
+    for k in state.weights:
+        weights[k] = [np.array(w) for w in state.weights[k]]
+    s['weights'] = weights
+
+    with open(path, 'wb') as f:
+        pickle.dump(s, f)
+
+
+def checkpoint_load(state, path, fields_to_load=None, weights_to_load=None):
+    with open(path, 'rb') as f:
+        s = pickle.load(f)
+    fields = s.get('fields', None)
+    if fields is not None:
+        if fields_to_load is None:
+            fields_to_load = fields.keys()
+        for k in fields_to_load:
+            state.fields[k] = fields[k]
+    weights = s.get('weights', None)
+    if weights is not None:
+        if weights_to_load is None:
+            weights_to_load = weights.keys()
+        for k in weights_to_load:
+            state.weights[k] = weights[k]
+
+
+def extrap_quadh(u0, u1, u1p):
+    '''
+    Quadratic extrapolation from points 0, 1, 1.5 to point 2.
+    Suffix `h` means half.
+    '''
+    u2 = (u0 - 6 * u1 + 8 * u1p) / 3
+    return u2
+
+
+def extrap_quad(u0, u1, u2):
+    'Quadratic extrapolation from points 0, 1, 2 to point 3.'
+    u3 = u0 - 3 * u1 + 3 * u2
+    return u3
+
+
+def extrap_linear(u0, u1):
+    'Linear extrapolation from points 0, 1 to point 2.'
+    u2 = 2 * u1 - u0
+    return u2
+
+
+def operator_laplace(mod, ctx):
+    dx = ctx.step('x')
+    dy = ctx.step('y')
+    ix = ctx.cell_index('x')
+    iy = ctx.cell_index('y')
+    zeros = ctx.field('zeros')
+    nx = ctx.size('x')
+    ny = ctx.size('y')
+
+    def stencil_var(key, freeze=False):
+        'Returns: q, qxm, qxp, qym, qyp'
+        st = [
+            ctx.field(key, freeze=freeze),
+            ctx.field(key, -1, 0, freeze=freeze),
+            ctx.field(key, 1, 0, freeze=freeze),
+            ctx.field(key, 0, -1, freeze=freeze),
+            ctx.field(key, 0, 1, freeze=freeze)
+        ]
+        return st
+
+    def laplace(st):
+        q, qxm, qxp, qym, qyp = st
+        q_xx = (qxp - 2 * q + qxm) / dx**2
+        q_yy = (qyp - 2 * q + qym) / dy**2
+        q_lap = q_xx + q_yy
+        return q_lap
+
+    def apply_bc_extrap(st):
+        'Linear extrapolation from inner cells to halo cells.'
+        st[1] = mod.where(ix == 0, extrap_linear(st[2], st[0]), st[1])
+        st[2] = mod.where(ix == nx - 1, extrap_linear(st[1], st[0]), st[2])
+        st[3] = mod.where(iy == 0, extrap_linear(st[4], st[0]), st[3])
+        st[4] = mod.where(iy == ny - 1, extrap_linear(st[3], st[0]), st[4])
+        return st
+
+    u_st = stencil_var('u')
+    v_st = stencil_var('v')
+    apply_bc_extrap(u_st)
+    apply_bc_extrap(v_st)
+    u_lap = laplace(u_st)
+    v_lap = laplace(v_st)
+    return u_lap, v_lap, zeros
+
+
+def latin_hypercube(ndim, size):
+    '''
+    Returns `size` points from the unit cube.
+    '''
+    # XXX Copied from pyDOE.
+    cut = np.linspace(0, 1, size + 1)
+    u = np.random.rand(size, ndim)
+    a = cut[:size]
+    b = cut[1:size + 1]
+    rdpoints = np.zeros_like(u)
+    for j in range(ndim):
+        rdpoints[:, j] = u[:, j] * (b - a) + a
+    H = np.zeros_like(rdpoints)
+    for j in range(ndim):
+        order = np.random.permutation(range(size))
+        H[:, j] = rdpoints[order, j]
+    return H

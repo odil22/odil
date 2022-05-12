@@ -1,0 +1,9 @@
+#!/bin/sh -eu
+
+: ${out=create_symlinks}
+
+for f in $(find . -type l) ; do
+  echo "rm -f '$f' && ln -s '$(readlink $f)' '$f'"
+done > $out
+
+chmod +x "$out"

@@ -1,0 +1,5 @@
+*.pdf
+*.pickle
+*.log
+*.json
+data*

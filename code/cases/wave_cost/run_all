@@ -1,0 +1,15 @@
+#!/bin/sh -eu
+
+
+if [ "${minimal:-0}" = "1" ] ; then
+  (cd fd_lbfgsb && mpirun ./vary.py --logN_samples 4 --logN_min 2 --logN_max 3 --epochs 1000)
+  (cd fd_newton && mpirun ./vary.py --logN_samples 4 --logN_min 2 --logN_max 3)
+  (cd pinn_lbfgsb && mpirun ./vary.py --seeds 1 --logN_samples 4 --logN_min 2 --logN_max 3 --epochs 1000 --Nci 128 --Ncb 32)
+else
+  (cd fd_lbfgsb && mpirun ./vary.py)
+  (cd fd_newton && mpirun ./vary.py)
+  (cd pinn_lbfgsb && mpirun ./vary.py)
+fi
+
+./load_lines_all
+./plot_lines_all.py

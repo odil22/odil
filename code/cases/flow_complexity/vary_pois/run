@@ -1,0 +1,3 @@
+#!/bin/sh -eu
+
+../vary.py --ref_path pois "$@"

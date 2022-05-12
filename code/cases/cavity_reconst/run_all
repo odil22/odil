@@ -1,0 +1,7 @@
+#!/bin/sh -eu
+
+if [ "${minimal:-0}" = "1" ] ; then
+  niter=1 ./run
+else
+  ./run
+fi

@@ -1,0 +1,1 @@
+../run --frames 0 --epochs 0 --plot_every 1

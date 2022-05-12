@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+
+set -ex
+
+./create_symlinks
+
+: ${minimal=1}
+
+export minimal
+export NOWARN=1
+export NOFONT=1
+
+(cd cases/cavity_reconst && ./run_all)
+(cd cases/cavity_stream && ./run_all)
+(cd cases/opt_cavity && ./run_all)
+(cd cases/velocity_from_tracer && ./run_all)
+(cd cases/wave_cost && ./run_all)
+(cd cases/flow_complexity && ./run_all)
+
+if [ -w / ] ; then
+  rsync -R cases/./*/*.pdf /results/
+else
+  rsync -R cases/./*/*.pdf results/
+fi

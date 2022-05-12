@@ -1,0 +1,7 @@
+#!/bin/sh -eu
+
+for d in vary_*/data.pickle ; do
+  d=${d%/*}
+  echo $d
+  (cd $d && ../plot_stat.py)
+done

@@ -1,0 +1,5 @@
+#!/bin/sh -eu
+
+for f in */*.pdf ; do
+  cp -v "$f" "${f%/*}.pdf"
+done

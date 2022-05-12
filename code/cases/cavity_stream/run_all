@@ -1,0 +1,10 @@
+#!/bin/sh -eu
+
+if [ "${minimal:-0}" = "1" ] ; then
+  Re=3200 N=64 niter=5 ./run
+else
+  Re=100 ./run
+  Re=400 ./run
+  Re=1000 ./run
+  Re=3200 ./run
+fi

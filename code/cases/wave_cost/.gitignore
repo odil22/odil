@@ -1,0 +1,4 @@
+data.pickle
+data_*
+*.pdf
+/*/lines.pickle
