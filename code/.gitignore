@@ -1,2 +1,13 @@
-__pycache__
+*.png
+*.jpg
+*.log
+*.pickle
+*.mp4
+*.csv
 *.pdf
+done
+args.json
+vary_Re_opt
+vary_wave
+ref_heat
+out_heat

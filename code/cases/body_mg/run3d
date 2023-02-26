@@ -1,0 +1,71 @@
+#!/bin/bash -eu
+
+: ${force=0}
+: ${extra=}
+: ${case=1}
+: ${body=circle}
+: ${blend=1}
+: ${nimp=2048}
+: ${gpus=0}
+: ${opt=lbfgs}
+: ${N=65}
+: ${pevery=2000}
+
+export NOWARN=1
+export USEGPU=1
+export CUDA_VISIBLE_DEVICES=$gpus
+
+: ${outdir=out_body3d}
+
+run () {
+  out="$outdir/train.csv"
+  if ! [ "$force" = "1" ] && [ -f "$out" ] ; then
+    echo "skip existing '$out'"
+    exit 1
+  fi
+  cmd="./body3d.py --outdir '$outdir' $@"
+  echo "$cmd"
+  eval "$cmd"
+}
+
+ext="--dim 3 --plot_every $pevery"
+
+name=${body}_blend${blend}
+[ "$N" != 65 ] && name="${name}_N${N}"
+
+ext="$ext --body $body"
+ext="$ext --blend $blend"
+ext="$ext --optimizer $opt"
+ext="$ext --N $N"
+
+refdir=ref3d_${name}
+reffile="$refdir/ref.pickle"
+if [ -f "$reffile" ] ; then
+  ext="$ext --ref_path $reffile"
+else
+  echo "Reference solution '$reffile' not found."
+fi
+
+ext="$ext $extra $@"
+
+case $case in
+  0)
+  echo "Forward problem, compute reference solution"
+  ext="$ext --checkpoint_every $pevery"
+  run $ext
+  mkdir -p "$refdir"
+  echo $outdir/{train.*,chi.*} "$refdir/"
+  cp -v $outdir/{train.*,*_00010.{xmf,raw},chi.*} "$refdir/"
+  cp -v "$outdir/state_010000.pickle" "$refdir/ref.pickle"
+  ;;
+  1)
+  echo "Forward problem"
+  run $ext
+  ;;
+  2)
+  echo "Inverse problem"
+  ext="$ext --infer_chi 1 --imposed ring --nimp $nimp"
+  run $ext
+  ;;
+esac
+

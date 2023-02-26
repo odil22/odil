@@ -5,7 +5,7 @@ from argparse import Namespace, ArgumentParser
 import matplotlib
 
 #matplotlib.use("pgf")  # Produces smaller files than Agg
-matplotlib.use("Agg")  # Produces smaller files than Agg
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as plticker
 from cycler import cycler
@@ -13,8 +13,7 @@ import numpy as np
 
 kConfig = {"units_enclosure": "()"}
 
-figsize_small = (2.4, 2.0)
-
+figsize_small = (1.7, 1.5)
 
 def cache_to_file(targetbase, update=False, arg0=False):
     """
@@ -107,24 +106,35 @@ def get_params():
     else:
         fontfamily = "Myriad Pro"
     params = {
-        'font.size': 9,
+        'font.size': 7,
         'font.family': fontfamily,
         'mathtext.fontset': 'custom',
         'mathtext.it': fontfamily + ':italic',
         'mathtext.rm': fontfamily,
         'mathtext.cal': fontfamily,
         'pdf.fonttype': 42,
+        'ps.fonttype': 42,
         'figure.figsize': figsize_small,
         'figure.autolayout': True,
-        'axes.autolimit_mode': 'round_numbers',
+        'savefig.bbox': 'tight',
         'axes.xmargin': 0,
         'axes.ymargin': 0,
+        'axes.autolimit_mode': 'round_numbers',
         'axes.spines.top': False,
         'axes.spines.right': False,
         'axes.unicode_minus': False,
         'axes.prop_cycle': cycler(color=colorscheme),
-        'lines.markersize': 3,
-        'lines.linewidth': 1.5,
+        'lines.markersize': 1.5,
+        'lines.linewidth': 1,
+        'axes.linewidth': 0.6,
+        'xtick.major.width': 0.6,
+        'xtick.minor.width': 0.4,
+        'xtick.major.size': 2.5,
+        'xtick.minor.size': 1.5,
+        'ytick.major.width': 0.6,
+        'ytick.minor.width': 0.4,
+        'ytick.major.size': 2.5,
+        'ytick.minor.size': 1.5,
     }
     return params
 

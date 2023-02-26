@@ -1,0 +1,81 @@
+#!/bin/bash -eu
+
+: ${force=1}
+: ${extra=}
+: ${case=1}
+: ${body=circle}
+: ${lamb=1}
+: ${blend=1}
+: ${nimp=512}
+: ${gpus=0}
+: ${opt=lbfgsb}
+
+export NOWARN=1
+export USEGPU=1
+export CUDA_VISIBLE_DEVICES=$gpus
+
+: ${outdir=out_body2d}
+
+run () {
+  out="$outdir/train.csv"
+  if ! [ "$force" = "1" ] && [ -f "$out" ] ; then
+    echo "skip existing '$out'"
+    return
+  fi
+  cmd="./body3d.py --outdir '$outdir' $@"
+  echo "$cmd"
+  eval "$cmd"
+}
+
+ext="--dim 2 --double 1"
+
+name=${body}_blend${blend}_lamb${lamb}
+
+ext="$ext --body $body"
+ext="$ext --blend $blend"
+ext="$ext --optimizer $opt"
+
+refdir=ref_${name}
+reffile="$refdir/ref.pickle"
+if [ -f "$reffile" ] ; then
+  ext="$ext --ref_path $reffile"
+else
+  echo "Reference solution '$reffile' not found."
+fi
+
+ext="$ext $extra $@"
+
+case $case in
+  0)
+  echo "Forward problem, compute reference solution"
+  ext="$ext --optimizer newton --mg 0 --linsolver direct"
+  ext="$ext --plot_every 10 --report_every 1 --history_every 1 --checkpoint_every 10"
+  run $ext
+  mkdir -p "$refdir"
+  cp -v $outdir/{train.*,*_00010.{xmf,raw},chi.*} "$refdir/"
+  cp -v "$outdir/state_000100.pickle" "$refdir/ref.pickle"
+  ;;
+  1)
+  echo "Forward problem"
+  run $ext
+  ;;
+  1n)
+  echo "Forward problem with Newton"
+  ext="$ext --optimizer newton --mg 0 --linsolver direct"
+  ext="$ext --plot_every 10 --report_every 1 --history_every 1"
+  run $ext
+  ;;
+  2)
+  echo "Inverse problem"
+  ext="$ext --infer_chi 1 --imposed ring --nimp $nimp"
+  run $ext
+  ;;
+  2n)
+  echo "Inverse problem with Newton"
+  ext="$ext --optimizer newton --mg 0 --linsolver direct"
+  ext="$ext --plot_every 1 --report_every 1 --history_every 1"
+  ext="$ext --infer_chi 1 --imposed ring --nimp $nimp"
+  run $ext
+  ;;
+esac
+

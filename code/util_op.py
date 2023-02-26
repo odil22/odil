@@ -6,10 +6,15 @@ import os
 import math
 from util import TIME, TIMECLEAR, Timer
 import pickle
+from argparse import Namespace
+import util_min
+from multigrid import Multigrid, MultigridOp, SparseOperator, StencilDict
 
 from tfwrap import tf
 
+
 class Domain:
+
     def __init__(
             self,
             lower=0.,
@@ -35,25 +40,32 @@ class Domain:
         self.frozen_weights = frozen_weights
         # Names of active weights.
         self.aweights = [k for k in neuralnets if k not in frozen_weights]
+        # Compute shapes of weights.
+        self.weight_shapes = dict()
+        for name in neuralnets:
+            layers = neuralnets[name]
+            res = []
+            for ni, no in zip(layers[:-1], layers[1:]):
+                res.append((ni, no))  # Weights.
+                res.append((no, ))  # Biases.
+            self.weight_shapes[name] = res
 
     def fields_size(self):
         return len(self.fieldnames) * np.prod(self.shape)
 
+    def get_minimal(self):
+        return util_min.Domain(self)
+
     def aweights_size(self):
         res = 0
         for name in self.aweights:
-            layers = self.neuralnets[name]
-            for ni, no in zip(layers[:-1], layers[1:]):
-                res += ni * no  # Weights.
-                res += no  # Biases
+            res += sum(np.prod(s) for s in self.weight_shapes[name])
         return res
 
     def weights_size(self):
         res = 0
-        for layers in self.neuralnets.values():
-            for ni, no in zip(layers[:-1], layers[1:]):
-                res += ni * no  # Weights.
-                res += no  # Biases
+        for name in self.neuralnets:
+            res += sum(np.prod(s) for s in self.weight_shapes[name])
         return res
 
     def cell_center_1d(self, i):
@@ -145,6 +157,7 @@ class Domain:
 
 
 class State:
+
     def __init__(self):
         self.fields = dict()
         self.weights = dict()
@@ -154,11 +167,14 @@ def convert_to_tf_variable(domain, state):
     # Convert to tf.Variable if needed.
     for name in state.fields:
         if not isinstance(state.fields[name], tf.Variable):
-            state.fields[name] = tf.Variable(state.fields[name])
+            state.fields[name] = tf.Variable(state.fields[name],
+                                             dtype=domain.dtype)
     for name in domain.aweights:
         if len(state.weights[name]) and \
                 not isinstance(state.weights[name][0], tf.Variable):
-            state.weights[name] = list(map(tf.Variable, state.weights[name]))
+            state.weights[name] = [
+                tf.Variable(w, dtype=domain.dtype) for w in state.weights[name]
+            ]
 
 
 def eval_neural_net(wb, *uu):
@@ -209,20 +225,33 @@ def eval_neural_net(wb, *uu):
 
 
 class NeuralNet:
+
     def __init__(self, weights, *inputs):
         self.weights = weights
-        self.inputs = [x if tf.is_tensor(x) else tf.constant(x) for x in inputs]
+        self.inputs = [
+            x if tf.is_tensor(x) else tf.constant(x) for x in inputs
+        ]
 
     def __call__(self, *deriv):
         f = eval_neural_net(self.weights, *self.inputs)
         assert len(deriv) == 0 or len(deriv) == len(self.inputs)
-        for i in range(len(deriv)):
-            for _ in range(deriv[i]):
-                f = tf.gradients(f, self.inputs[i])[0]
-        return f
+
+        def grad(f):
+            for i in range(len(deriv)):
+                for _ in range(deriv[i]):
+                    f = tf.gradients(f, self.inputs[i])[0]
+            return f
+
+        if not isinstance(f, list):
+            f = [f]
+        res = [grad(f[i]) for i in range(len(f))]
+        if len(res) == 1:
+            res = res[0]
+        return res
 
 
 class Context:
+
     def __init__(self,
                  domain,
                  args,
@@ -230,6 +259,7 @@ class Context:
                  state_fields,
                  state_weights,
                  epoch=0,
+                 extra=None,
                  split_shifts=True):
         '''
         split_shifts: Treat gradients over shifted fields independently.
@@ -241,6 +271,7 @@ class Context:
         self.state_weights = state_weights
         self.split_shifts = split_shifts
         self.epoch = epoch
+        self.extra = extra
 
     def size(self, i):
         domain = self.domain
@@ -319,7 +350,8 @@ class Context:
 
 
 class Problem:
-    def __init__(self, operator, domain):
+
+    def __init__(self, operator, domain, extra=None):
         '''
         operator: callable(mod, ctx)
             Discrete operator returning fields on grid.
@@ -333,31 +365,46 @@ class Problem:
         self.operator = operator
         self.timer_total = Timer()
         self.timer_last = Timer()
+        self.extra = extra
 
-    # XXX _eval_grad() must take members of State explicitly.
-    #     Otherwise, the operator is not computed correctly (possibly frozen).
-    @tf.function
-    def _eval_grad(self, state_fields, state_weights, epoch):
+    def _eval_grad0(self, state_fields, state_weights, epoch):
         domain = self.domain
         args = []  # Field arguments for which gradients are computed.
         field_desc = []  # Field descriptors: (i, shift) for `fieldnames[i]`.
         wargs = [w for name in domain.aweights for w in state_weights[name]]
-        with tf.GradientTape(persistent=True) as tape:
+        with tf.GradientTape(persistent=True,
+                             watch_accessed_variables=True) as tape:
+            tape.watch(wargs)
             ctx = Context(domain,
                           args,
                           field_desc,
                           state_fields,
                           state_weights,
                           epoch=epoch,
+                          extra=self.extra,
                           split_shifts=True)
             ff = self.operator(tf, ctx)
             if not isinstance(ff, tuple) and not isinstance(ff, list):
                 ff = (ff, )
         grads = [tape.gradient(f, args) for f in ff]
-        wgrads = [tape.jacobian(f, wargs) for f in ff]
+        # Having experimental_use_pfor=True leads to excessive memory usage,
+        # sufficient to store a dense matrix of size `prod(domain.shape)**2`.
+        if len(wargs):
+            wgrads = [
+                tape.jacobian(ff[i], wargs, experimental_use_pfor=False)
+                for i in range(len(ff))
+            ]
+        else:
+            wgrads = [[] for _ in range(len(ff))]
         return ff, grads, field_desc, wgrads
 
-    @tf.function
+    # XXX _eval_grad() must take members of State explicitly.
+    #     Otherwise, the operator is not computed correctly (frozen).
+    @tf.function(jit_compile=False)
+    def _eval_grad(self, state_fields, state_weights, epoch):
+        return self._eval_grad0(state_fields, state_weights, epoch)
+
+    @tf.function(jit_compile=False)
     def _eval_loss(self, state_fields, state_weights, epoch):
         domain = self.domain
         args = []  # Field arguments for which gradients are computed.
@@ -371,21 +418,23 @@ class Problem:
                           state_fields,
                           state_weights,
                           epoch=epoch,
+                          extra=self.extra,
                           split_shifts=False)
             ff = self.operator(tf, ctx)
             if not isinstance(ff, tuple) and not isinstance(ff, list):
                 ff = (ff, )
-            loss = sum([tf.reduce_mean(tf.square(f)) for f in ff])
+            loss_split = [tf.reduce_mean(tf.square(f)) for f in ff]
+            loss = sum(loss_split)
         grads = tape.gradient(loss, args)
         wgrads = tape.gradient(loss, wargs)
-        return loss, grads, field_desc, wgrads
+        return loss, grads, field_desc, wgrads, loss_split
 
     def pack_fields(self, fields):
         res = []
         for name in self.domain.fieldnames:
-            res.append(np.reshape(fields[name], -1))
-        if res:
-            res = np.hstack(res)
+            res.append(tf.reshape(fields[name], [-1]))
+        if len(res):
+            res = tf.concat(res, axis=-1)
         return res
 
     def unpack_fields(self, packed):
@@ -394,26 +443,24 @@ class Problem:
         i = 0
         N = np.prod(shape)
         for name in self.domain.fieldnames:
-            fields[name] = np.reshape(packed[i:i + N], shape)
+            fields[name] = tf.reshape(packed[i:i + N], shape)
             i += N
         return fields
 
     def pack_weights(self, weights, with_frozen=False):
         res = []
-        names = self.domain.neuralnets if with_frozen else self.domain.aweights
+        domain = self.domain
+        names = domain.neuralnets if with_frozen else domain.aweights
         for name in names:
             ww = weights[name]
-            layers = self.domain.neuralnets[name]
-            i = 0
-            for ni, no in zip(layers[:-1], layers[1:]):
-                w = ww[i] if ww[i] is not None else np.zeros((ni, no))
-                res.append(np.reshape(w, -1))
-                i += 1
-                w = ww[i] if ww[i] is not None else np.zeros(no)
-                res.append(np.reshape(w, -1))
-                i += 1
-        if res:
-            res = np.hstack(res)
+            for i, s in enumerate(domain.weight_shapes[name]):
+                if ww[i] is not None:
+                    w = ww[i]
+                else:
+                    w = tf.zeros(s, dtype=domain.dtype)
+                res.append(tf.reshape(w, [-1]))
+        if len(res):
+            res = tf.concat(res, axis=-1)
         return res
 
     def unpack_weights(self, packed, with_frozen=False):
@@ -426,7 +473,7 @@ class Problem:
             ww = []
             for ni, no in zip(layers[:-1], layers[1:]):
                 # Weights.
-                ww.append(np.reshape(packed[i:i + ni * no], (ni, no)))
+                ww.append(tf.reshape(packed[i:i + ni * no], (ni, no)))
                 i += ni * no
                 # Biases.
                 ww.append(packed[i:i + no])
@@ -435,10 +482,13 @@ class Problem:
         return weights
 
     def pack_state(self, state, with_frozen=False):
-        packed = np.hstack((
-            self.pack_fields(state.fields),
-            self.pack_weights(state.weights, with_frozen),
-        ))
+        packed = tf.concat(
+            [
+                self.pack_fields(state.fields),
+                self.pack_weights(state.weights, with_frozen),
+            ],
+            axis=-1,
+        )
         return packed
 
     def unpack_state(self, packed, with_frozen=False):
@@ -476,14 +526,24 @@ class Problem:
                     # Biases
                     ww.append(tf.zeros(no, dtype=domain.dtype))
                 state.weights[name] = ww
-            ww = state.weights[name]
-            if not isinstance(ww, list):
-                raise TypeError("Expected a list of arrays for "
-                                "weights of neural network '{}'".format(name))
+            else:
+                ww = state.weights[name]
+                if not isinstance(ww, list):
+                    raise TypeError(
+                        "Expected a list of arrays for "
+                        "weights of neural network '{}'".format(name))
+                for i in range(len(ww)):
+                    assert len(ww) == len(domain.weight_shapes[name]),\
+                            "Invalid number of weights, " \
+                            "expected {:}, got {:}".format(
+                                len(domain.weight_shapes[name]), hlen(ww))
+                    if not tf.is_tensor(ww[i]):
+                        ww[i] = np.array(ww[i], dtype=domain.dtype).reshape(
+                            domain.weight_shapes[name][i])
 
         convert_to_tf_variable(domain, state)
 
-    def linearize(self, state, epoch=0):
+    def linearize(self, state, epoch=0, mod=np, modsp=scipy.sparse):
         domain = self.domain
         self.init_missing(state)
 
@@ -497,46 +557,66 @@ class Problem:
 
         Nu = len(domain.fieldnames)  # Number of unknown fields.
         N = np.prod(domain.shape)  # Number of cells.
-        Nf = len(const)  # Number of equation fields.
-        mshape = (Nf * N, Nu * N)  # Shape of sparse matrix from fields.
+        # Total number of scalar equations.
+        Ne = sum(np.prod(eq.shape, dtype=int) for eq in const)
+        mshape = (Ne, Nu * N)  # Shape of sparse matrix from fields.
 
         timer.push("sparse_fields")
-        linear = scipy.sparse.csr_matrix(mshape, dtype=domain.dtype)
-        row = np.arange(N)
-        col_diag = np.reshape(row, domain.shape)
-        for i in range(Nf):  # Loop over equations.
-            for j in range(len(field_desc)):  # Loop over grid field arguments.
+        linear = modsp.csr_matrix(mshape, dtype=domain.dtype)
+        row = mod.arange(N)
+        col_diag = mod.reshape(row, domain.shape)
+        for i in range(len(const)):  # Loop over equations.
+            for j in range(len(field_desc)):  # Loop over grid field variables.
                 index, shift = field_desc[j]
-                col = np.roll(col_diag,
-                              shift=np.negative(shift),
-                              axis=range(domain.ndim)).flatten()
+                index = index.numpy()
+                col = mod.roll(col_diag,
+                               shift=np.negative(shift),
+                               axis=range(domain.ndim)).flatten()
                 g = grads[i][j]
                 if g is not None:
-                    g = g.numpy().flatten()
-                    a = scipy.sparse.csr_matrix(
-                        (g, (row + i * N, col + index * N)), shape=mshape)
+                    g = mod.array(g.numpy().flatten())
+                    a = modsp.csr_matrix((g, (row + i * N, col + index * N)),
+                                         dtype=domain.dtype,
+                                         shape=mshape)
                     linear += a
+
         timer.pop()
 
         timer.push("sparse_weights")
         Nw = domain.aweights_size()  # Size of weights of neural networks.
         mmw = []  # Matrices with gradients for each equation.
-        for i in range(Nf):  # Loop over equations.
+        for i in range(len(const)):  # Loop over equations.
+            # Shape of equation.
+            # Equals domain.shape for fields and arbitrary for neural networks.
+            eqshape = tuple(const[i].shape)
+            Nei = np.prod(eqshape, dtype=int)  # Number of scalar equations.
             ww = wgrads[i]
-            if len(ww) and ww[0] is not None:
-                ww = [tf.reshape(w, domain.shape + (-1, )) for w in ww]
-                mw = tf.concat(ww, axis=domain.ndim)
-                mw = tf.reshape(mw, (N, -1))
+            wshapes = [
+                s for name in domain.aweights
+                for s in domain.weight_shapes[name]
+            ]
+            assert len(ww) == len(wshapes)
+            # Replace None with zeros.
+            ww = [
+                tf.zeros(eqshape + s, dtype=domain.dtype) if w is None else w
+                for w, s in zip(ww, wshapes)
+            ]
+            ww = [tf.reshape(w, eqshape + (-1, )) for w in ww]
+            if Nw:
+                mw = tf.concat(ww, axis=len(eqshape))
+                mw = tf.reshape(mw, (Nei, -1))
                 # Dense matrix with gradients.
-                mw = scipy.sparse.csr_matrix(mw, shape=(N, Nw))
+                mw = modsp.csr_matrix(mw, shape=(Nei, Nw))
             else:
                 # Empty matrix.
-                mw = scipy.sparse.csr_matrix((N, Nw), dtype=domain.dtype)
+                mw = modsp.csr_matrix((Nei, Nw), dtype=domain.dtype)
             mmw.append(mw)
-        mmw = scipy.sparse.vstack(mmw)
+        mmw = modsp.vstack(mmw)
         # Append gradients from weights to gradients from fields.
-        linear = scipy.sparse.hstack((linear, mmw))
+        linear = modsp.hstack([linear, mmw])
         timer.pop()
+
+        const = [mod.array(eq.numpy()) for eq in const]
 
         self.timer_total.append(timer)
         self.timer_last = timer
@@ -551,7 +631,7 @@ class Problem:
 
         epoch = tf.constant(epoch, dtype=domain.dtype)
         timer.push("eval_grad")
-        loss, raw_grads, field_desc, raw_wgrads = self._eval_loss(
+        loss, raw_grads, field_desc, raw_wgrads, loss_split = self._eval_loss(
             state.fields, state.weights, epoch)
         timer.pop("eval_grad")
 
@@ -561,7 +641,7 @@ class Problem:
             grads[domain.fieldnames[i]] = g
         for name in domain.fieldnames:
             if name not in grads:
-                grads[name] = np.zeros(domain.shape, dtype=domain.dtype)
+                grads[name] = tf.zeros(domain.shape, dtype=domain.dtype)
 
         wgrads = dict()
         for i, name in enumerate(domain.aweights):
@@ -570,7 +650,7 @@ class Problem:
         self.timer_total.append(timer)
         self.timer_last = timer
 
-        return loss, grads, wgrads
+        return loss, grads, wgrads, loss_split
 
 
 def checkpoint_save(state, path):
@@ -589,7 +669,11 @@ def checkpoint_save(state, path):
         pickle.dump(s, f)
 
 
-def checkpoint_load(state, path, fields_to_load=None, weights_to_load=None):
+def checkpoint_load(state,
+                    path,
+                    fields_to_load=None,
+                    weights_to_load=None,
+                    skip_missing=True):
     with open(path, 'rb') as f:
         s = pickle.load(f)
     fields = s.get('fields', None)
@@ -597,12 +681,16 @@ def checkpoint_load(state, path, fields_to_load=None, weights_to_load=None):
         if fields_to_load is None:
             fields_to_load = fields.keys()
         for k in fields_to_load:
+            if not skip_missing and k not in fields:
+                raise RuntimeError("Missing field {}".format(k))
             state.fields[k] = fields[k]
     weights = s.get('weights', None)
     if weights is not None:
         if weights_to_load is None:
             weights_to_load = weights.keys()
         for k in weights_to_load:
+            if not skip_missing and k not in weights:
+                raise RuntimeError("Missing weights {}".format(k))
             state.weights[k] = weights[k]
 
 
