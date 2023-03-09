@@ -108,7 +108,10 @@ def operator_ns(mod, ctx, args=None):
             qw = ctx.neural_net(key)()
             if freeze and args.wfreeze:
                 qw = tf.stop_gradient(qw)
-            q = MultigridDecomp.weights_to_field(qw, problem.nnw, mod)
+            q = MultigridDecomp.weights_to_node_field(qw,
+                                                      problem.nnw,
+                                                      mod,
+                                                      method=args.mg_interp)
             st = [None] * (2 * dim + 1)
             st[0] = q
             for i in dirs:
@@ -564,7 +567,10 @@ def parse_args():
 def state_to_field(key, nnw, state):
     if key in state.weights:
         uw = np.array(state.weights[key][1])
-        u = MultigridDecomp.weights_to_field(uw, nnw, tf)
+        u = MultigridDecomp.weights_to_node_field(uw,
+                                                  nnw,
+                                                  tf,
+                                                  method=args.mg_interp)
     else:
         u = state.fields[key]
     return np.array(u)
@@ -581,7 +587,6 @@ def write_field(u, name, path, domain):
 def plot(problem, state, epoch, frame):
     domain = problem.domain
     dim = domain.ndim
-    dw = [domain.step_by_dim(i) for i in range(dim)]
     paths = []
     keys = ['vx', 'vy', 'vz'][:dim] + ['p']
     if 'chi' in domain.neuralnets or 'chi' in domain.fieldnames:

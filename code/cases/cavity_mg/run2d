@@ -1,0 +1,36 @@
+#!/bin/sh -eu
+
+: ${force=0}
+: ${Re=100}
+: ${N=65}
+
+export NOWARN=1
+export OMP_NUM_THREADS=1
+export TENSORFLOW_INTER_OP_PARALLELISM=1
+export TENSORFLOW_INTRA_OP_PARALLELISM=1
+
+: ${outdir=out_cavity2d_re${Re}}
+
+extra="--N ${N} --Re ${Re} --ref_path cavity_N${N}_Re${Re}.pickle"
+extra="$extra --opt lbfgsb --plot_every 10000 --double 1"
+
+extra="$extra $@"
+
+run() {
+  out="$outdir/train_$1.csv"
+  if ! [ "$force" = "1" ] && [ -f "$out" ] ; then
+    echo "skip existing '$out'"
+    return
+  fi
+  cmd="./cavity2d.py --outdir '$outdir' --nlvl $1 $extra"
+  echo "$cmd"
+  eval "$cmd"
+  cp -v "$outdir/train.csv" "$out"
+}
+
+run 1
+run 2
+run 3
+run 4
+run 5
+./plot_train.py $outdir

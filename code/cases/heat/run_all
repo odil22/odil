@@ -1,0 +1,8 @@
+#!/bin/sh -eu
+
+: ${force=0}
+
+case=0 outdir=out_ref ./run
+case=2n outdir=out_odiln ./run
+case=2 outdir=out_odil ./run
+case=2 outdir=out_odilmg ./run --mg 1

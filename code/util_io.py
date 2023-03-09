@@ -38,13 +38,15 @@ def write_raw_xmf(xmfpath,
                   count,
                   spacing=(1, 1, 1),
                   name='data',
-                  precision=8):
+                  precision=8,
+                  cell=True):
     '''
     Writes XMF metadata for a `.raw` datafile.
     xmfpath: path to output `.xmf` file
     rawpath: path to binary `.raw` file to be linked
     count: array size as (Nz, Ny, Nx)
     name: name of field
+    cell: cell-centered field, else node-centered
     '''
 
     txt = '''\
@@ -62,7 +64,7 @@ def write_raw_xmf(xmfpath,
          {spacing*}
        </DataItem>
      </Geometry>
-     <Attribute Name="{name}" AttributeType="Scalar" Center="Cell">
+     <Attribute Name="{name}" AttributeType="Scalar" Center="{center}">
        <DataItem ItemType="HyperSlab" Dimensions="{countd*}" Type="HyperSlab">
            <DataItem Dimensions="3 {dim}" Format="XML">
              {start*}
@@ -96,7 +98,12 @@ def write_raw_xmf(xmfpath,
     info['count'] = tostr(count)
     info['bindim'] = tostr(count)
     info['countd'] = tostr(count)
-    info['nodes'] = tostr([a + 1 for a in count])
+    if cell:
+        info['nodes'] = tostr([a + 1 for a in count])
+        info['center'] = 'Cell'
+    else:
+        info['nodes'] = tostr([a for a in count])
+        info['center'] = 'Node'
     info['precision'] = precision
     if precision == 8:
         info['type'] = 'Double'
@@ -117,6 +124,7 @@ def write_raw_with_xmf(u,
                        xmfpath,
                        rawpath=None,
                        spacing=(1, 1, 1),
+                       cell=True,
                        name='data'):
     '''
     Writes binary data in raw format with XMF metadata.
@@ -131,6 +139,6 @@ def write_raw_with_xmf(u,
     precision = 4 if u.dtype == np.float32 else 8
     if rawpath is None:
         rawpath = os.path.splitext(xmfpath)[0] + ".raw"
-    write_raw_xmf(xmfpath, rawpath, u.shape, spacing, name, precision)
+    write_raw_xmf(xmfpath, rawpath, u.shape, spacing, name, precision, cell)
     u.tofile(rawpath)
     return xmfpath

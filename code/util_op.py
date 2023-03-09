@@ -17,16 +17,18 @@ class Domain:
 
     def __init__(
             self,
+            ndim=None,
             lower=0.,
             upper=1.,
-            ndim=None,
             shape=None,
-            varnames=('x', 'y', 'z'),  # Independent variables.
-            fieldnames=('u', 'v'),  # Unknown fields.
+            varnames=['x', 'y', 'z'],  # Independent variables.
+            fieldnames=[],  # Unknown fields.
             neuralnets=dict(),  # Neural networks dict(name:layers)
             frozen_weights=[],
             frozen_fields=[],
             dtype=np.float64):
+        if ndim is None:
+            ndim = len(varnames)
         self.ndim = ndim
         if shape is not None and ndim is not None:
             assert len(shape) == ndim
@@ -68,11 +70,16 @@ class Domain:
             res += sum(np.prod(s) for s in self.weight_shapes[name])
         return res
 
+    def step_by_dim(self, i):
+        return (self.upper[i] - self.lower[i]) / self.shape[i]
+
     def cell_center_1d(self, i):
-        s = self.shape[i]
-        x = np.asarray(self.lower[i] + (np.arange(s) + 0.5) / s *
-                       (self.upper[i] - self.lower[i]),
-                       dtype=self.dtype)
+        x = np.linspace(self.lower[i],
+                        self.upper[i],
+                        self.shape[i],
+                        endpoint=False,
+                        dtype=self.dtype)
+        x += (x[1] - x[0]) * 0.5
         return x
 
     def cell_center_all(self):
@@ -93,8 +100,30 @@ class Domain:
             return self.cell_center_by_dim(i)
         return None
 
-    def step_by_dim(self, i):
-        return (self.upper[i] - self.lower[i]) / self.shape[i]
+    def cell_node_1d(self, i):
+        x = np.linspace(self.lower[i],
+                        self.upper[i],
+                        self.shape[i] + 1,
+                        dtype=self.dtype)
+        return x
+
+    def cell_node_all(self):
+        xx = [self.cell_node_1d(i) for i in range(self.ndim)]
+        res = np.meshgrid(*xx, indexing='ij')
+        return res
+
+    def cell_node_by_dim(self, i):
+        #TODO Only create meshgrid for one component.
+        return self.cell_node_all()[i]
+
+    def cell_node_by_name(self, name):
+        '''
+        Returns cell nodes in direction `name` (e.g. 'x').
+        '''
+        if name in self.varnames:
+            i = self.varnames.index(name)
+            return self.cell_node_by_dim(i)
+        return None
 
     def cell_index_all(self):
         return np.meshgrid(*[np.arange(s) for s in self.shape], indexing='ij')
@@ -113,6 +142,35 @@ class Domain:
             i = names.index(name)
             return self.cell_index_by_dim(i)
         return None
+
+    def node_index_all(self):
+        return np.meshgrid(*[np.arange(s + 1) for s in self.shape],
+                           indexing='ij')
+
+    def node_index_by_dim(self, i):
+        #TODO Only create meshgrid for one component.
+        return self.node_index_all()[i]
+
+    # Aliases consistent with Context.
+    def step(self, i):
+        if isinstance(i, str):
+            i = self.varnames.index(i)
+        return self.step_by_dim(i)
+
+    def cell_index(self, i):
+        if isinstance(i, str):
+            i = self.varnames.index(i)
+        return self.cell_index_by_dim(i)
+
+    def node_index(self, i):
+        if isinstance(i, str):
+            i = self.varnames.index(i)
+        return self.node_index_by_dim(i)
+
+    def size(self, i):
+        if isinstance(i, str):
+            i = self.varnames.index(i)
+        return self.shape[i]
 
     def custom_by_name(self, name):
         if name == "zeros":
@@ -291,6 +349,12 @@ class Context:
             i = domain.varnames.index(i)
         return domain.cell_index_by_dim(i)
 
+    def node_index(self, i):
+        domain = self.domain
+        if isinstance(i, str):
+            i = domain.varnames.index(i)
+        return domain.node_index_by_dim(i)
+
     def cell_center(self, i):
         domain = self.domain
         if isinstance(i, str):
@@ -428,6 +492,64 @@ class Problem:
         grads = tape.gradient(loss, args)
         wgrads = tape.gradient(loss, wargs)
         return loss, grads, field_desc, wgrads, loss_split
+
+    @tf.function(jit_compile=False)
+    def _eval_diag_tf(self, state_fields, state_weights, epoch):
+        domain = self.domain
+        args = []  # Field arguments for which gradients are computed.
+        field_desc = []  # Index in `fieldnames` of the field argument.
+        wargs = [state_weights[name] for name in domain.aweights]
+        with tf.GradientTape(persistent=True,
+                             watch_accessed_variables=True) as tape:
+            ctx = Context(domain,
+                          args,
+                          field_desc,
+                          state_fields,
+                          state_weights,
+                          epoch=epoch,
+                          extra=None,
+                          split_shifts=False)
+            ff = self.operator(tf, ctx)
+            if not isinstance(ff, tuple) and not isinstance(ff, list):
+                ff = (ff, )
+            lossn = sum([
+                tf.reduce_sum(
+                    f * tf.random.normal(f.shape, dtype=domain.dtype)) /
+                (tf.cast(tf.size(f), domain.dtype)**0.5) for f in ff
+            ])
+        grads = tape.gradient(lossn, args)
+        wgrads = tape.gradient(lossn, wargs)
+
+        res = dict()
+        for g, (i, shift) in zip(grads, field_desc):
+            assert shift == (0, ) * domain.ndim
+            res[domain.fieldnames[i]] = g
+        for name in domain.fieldnames:
+            if name not in res:
+                g[name] = tf.zeros(domain.shape, dtype=domain.dtype)
+
+        resw = dict()
+        for i, name in enumerate(domain.aweights):
+            resw[name] = wgrads[i]
+
+        res = self.pack_fields(res)
+        resw = self.pack_weights(resw)
+        res = tf.concat([res, resw], axis=-1)
+        return res
+
+    def eval_diag(self, state, epoch=0, nsmp=10):
+        domain = self.domain
+        self.init_missing(state)
+        epoch = tf.constant(epoch, dtype=domain.dtype)
+        gsum = None
+        for smp in range(nsmp):
+            g = self._eval_diag_tf(state.fields, state.weights, epoch)
+            if smp == 0:
+                gsum = tf.square(g)
+            else:
+                gsum += tf.square(g)
+
+        return gsum / nsmp
 
     def pack_fields(self, fields):
         res = []

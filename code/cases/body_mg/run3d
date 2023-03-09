@@ -4,7 +4,6 @@
 : ${extra=}
 : ${case=1}
 : ${body=circle}
-: ${blend=1}
 : ${nimp=2048}
 : ${gpus=0}
 : ${opt=lbfgs}
@@ -30,11 +29,10 @@ run () {
 
 ext="--dim 3 --plot_every $pevery"
 
-name=${body}_blend${blend}
+name=${body}
 [ "$N" != 65 ] && name="${name}_N${N}"
 
 ext="$ext --body $body"
-ext="$ext --blend $blend"
 ext="$ext --optimizer $opt"
 ext="$ext --N $N"
 
@@ -54,7 +52,6 @@ case $case in
   ext="$ext --checkpoint_every $pevery"
   run $ext
   mkdir -p "$refdir"
-  echo $outdir/{train.*,chi.*} "$refdir/"
   cp -v $outdir/{train.*,*_00010.{xmf,raw},chi.*} "$refdir/"
   cp -v "$outdir/state_010000.pickle" "$refdir/ref.pickle"
   ;;

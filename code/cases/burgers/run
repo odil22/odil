@@ -1,0 +1,107 @@
+#!/bin/sh -eu
+
+: ${force=0}
+: ${ext=}
+: ${case=0}
+: ${gpus=0}
+: ${pevery=1000}
+: ${solver=odil}
+: ${outdir=out_burgers}
+: ${N=64}
+: ${extra=}
+: ${imposed=recth}
+
+export NOWARN=1
+export USEGPU=1
+export CUDA_VISIBLE_DEVICES=$gpus
+
+run () {
+  out="$outdir/train.csv"
+  if ! [ "$force" = "1" ] && [ -f "$out" ] ; then
+    echo "skip existing '$out'"
+    exit 0
+  fi
+  cmd="./burgers.py --outdir '$outdir' --Nt $N --Nx $N $@ $extra"
+  echo "$cmd"
+  eval "$cmd"
+}
+
+extra="$extra $@"
+
+ext=
+ext="$ext --plot_every 1000 --report_every 100 --history_every 10 --frames 10"
+ext="$ext --solver $solver"
+ext="$ext --plotext png --plot_title 1"
+
+refdir="ref_burgers"
+refpath="$refdir/ref.pickle"
+if [ -f "$refpath" ] ; then
+  ext="$ext --ref_path $refpath"
+else
+  echo "Reference solution '$refpath' not found."
+fi
+
+case $case in
+  0)
+  echo "Forward problem, compute reference solution"
+  if ! [ "$force" = "1" ] && [ -f "$refpath" ] ; then
+    echo "skip existing '$refpath'"
+    exit 0
+  fi
+  ext="$ext --imposed init --bc 1"
+  ext="$ext --optimizer newton --mg 0 --kxreg 1e-2 --ktreg 1e-2"
+  ext="$ext --report_every 1 --plot_every 10 --checkpoint_every 100"
+  run $ext
+  mkdir -p "$refdir"
+  cp -v $outdir/{train.*,args.json} "$refdir/"
+  cp -v "$outdir/state_000100.pickle" "$refpath"
+  ;;
+  0d)
+  echo "Forward problem direct, compute reference solution"
+  if ! [ "$force" = "1" ] && [ -f "$refpath" ] ; then
+    echo "skip existing '$refpath'"
+    exit 0
+  fi
+  ext="$ext --solver direct --checkpoint_every 1 --report_every 1 --plot_every 1"
+  run $ext
+  mkdir -p "$refdir"
+  cp -v $outdir/{train.*,args.json} "$refdir/"
+  cp -v "$outdir/state_000001.pickle" "$refpath"
+  ;;
+  1)
+  echo "Forward problem with L-BFGS"
+  ext="$ext --imposed init --bc 1"
+  run $ext
+  ;;
+  1)
+  echo "Forward problem with L-BFGS"
+  ext="$ext --imposed init --bc 1"
+  run $ext
+  ;;
+  1n)
+  echo "Forward problem with Newton"
+  ext="$ext --imposed init --bc 1"
+  ext="$ext --optimizer newton --mg 0 --kxreg 1e-2 --ktreg 1e-2"
+  ext="$ext --report_every 1 --plot_every 10"
+  run $ext
+  ;;
+  2)
+  echo "Inverse problem with L-BFGS"
+  ext="$ext --imposed $imposed"
+  run $ext
+  ;;
+  2n)
+  echo "Inverse problem with Newton"
+  ext="$ext --imposed $imposed"
+  ext="$ext --optimizer newton --mg 0 --kxreg 1e-2 --ktreg 1e-2"
+  ext="$ext --report_every 1 --plot_every 10"
+  run $ext
+  ;;
+  3)
+  echo "Inverse problem with PINN"
+  ext="$ext --infer_k 1 --imposed $imposed"
+  ext="$ext --solver pinn --arch 32 32 32 32 --Nci 4096 --Ncb 128"
+  run $ext
+  ;;
+esac
+

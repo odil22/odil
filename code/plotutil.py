@@ -1,6 +1,7 @@
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 
 g_extlist = None
 
@@ -14,7 +15,13 @@ def set_extlist(extlist=None):
 
 set_extlist()
 
-def savefig(fig, path, extlist=None, **kwargs):
+
+def savefig(fig,
+            path,
+            extlist=None,
+            skip_existing=False,
+            printf=print,
+            **kwargs):
     if extlist is None:
         extlist = g_extlist
     for ext in extlist:
@@ -25,7 +32,10 @@ def savefig(fig, path, extlist=None, **kwargs):
             'CreationDate': None,
         } if ext == 'pdf' else {}
         p = path + '.' + ext
-        print(p)
+        if skip_existing and os.path.isfile(p):
+            printf("skip existing '{}'".format(p))
+            continue
+        printf(p)
         fig.savefig(p, metadata=metadata, **kwargs)
 
 

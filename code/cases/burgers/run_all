@@ -1,0 +1,9 @@
+#!/bin/sh -eu
+
+outdir=out_ref case=0 ./run
+outdir=out_inv case=2 ./run
+outdir=out_invmg0 case=2 ./run --mg 0
+outdir=out_invn case=2n ./run
+outdir=out_inv_noise case=2 ./run --noise 0.05
+outdir=out_invmg0_noise case=2 ./run --noise 0.05 --mg 0
+outdir=out_invn_noise case=2n ./run --noise 0.05

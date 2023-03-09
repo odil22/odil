@@ -189,6 +189,31 @@ def add_arguments(parser):
                         type=int,
                         default=50,
                         help="History size for L-BFGS")
+    parser.add_argument('--mg_interp',
+                        type=str,
+                        default='conv',
+                        choices=['roll', 'conv', 'manual'],
+                        help="Multigrid interpolation method")
+    parser.add_argument('--dump_data',
+                        type=int,
+                        default=1,
+                        help="Dump data_*.pickle with every plot")
+    parser.add_argument('--jac_nsmp0',
+                        type=int,
+                        default=50,
+                        help="Number of samples "
+                        "for initialization of Jacobi optimizer")
+    parser.add_argument('--jac_nsmp1',
+                        type=int,
+                        default=1,
+                        help="Number of samples "
+                        "for each step of Jacobi optimizer")
+    parser.add_argument('--jac_factor',
+                        type=float,
+                        default=1,
+                        help="Factor for the diagonal update"
+                        "for each step of Jacobi optimizer. "
+                        "Increase above 1 for more weight to recent values")
 
 
 def optimize_newton(args, problem, state, callback):
@@ -259,9 +284,56 @@ def optimize_opt(args, optname, problem, state, callback, **kwargs):
     printlog(info)
 
 
+
+
+def optimize_jacobi(args, problem, state, callback):
+    opt = optimizer.Optimizer(name='jacobi', displayname='Jacobi')
+    printlog("Running {} optimizer".format(opt.displayname))
+    packed = problem.pack_state(state)
+    dhistory = defaultdict(lambda: [])
+
+    nsmp0 = args.jac_nsmp0
+    nsmp1 = args.jac_nsmp1
+    factor = args.jac_factor
+    diag = problem.eval_diag(state, epoch=args.epoch_start, nsmp=nsmp0)
+    ntotal = nsmp0
+
+    for epoch in range(args.epoch_start, args.epochs + 1):
+        s = problem.unpack_state(packed)
+        problem.domain.assign_active_state(state, s)
+
+        loss, grads, wgrads, loss_split = problem.eval_loss_grad(state,
+                                                                 epoch=epoch)
+        diag1 = problem.eval_diag(state, epoch=epoch, nsmp=nsmp1)
+
+        def upd(avg0, n0, avg1, n1):
+            return (avg0 * n0 + avg1 * n1 * factor) / (n0 + n1 * factor)
+
+        diag = upd(diag, ntotal, diag1, nsmp1)
+        ntotal += nsmp1
+
+        g = problem.pack_fields(grads)
+        wg = problem.pack_weights(wgrads)
+        g = tf.concat([g, wg], axis=-1)
+        dpacked = -(g / diag) * (args.lr * 0.5)
+
+        # Compute loss and residuals with initial state, to be used by callback.
+        opt.last_loss = loss.numpy()
+        opt.last_residual = [v.numpy()**0.5 for v in loss_split]
+        callback(packed, epoch, dhistory=dhistory, opt=opt)
+        if epoch == args.epochs:
+            break
+
+        opt.evals += 1
+
+        packed += dpacked
+
+
 def optimize(args, optname, problem, state, callback, **kwargs):
     if optname == 'newton':
         return optimize_newton(args, problem, state, callback)
+    elif optname == 'jacobi':
+        return optimize_jacobi(args, problem, state, callback)
     return optimize_opt(args, optname, problem, state, callback)
 
 

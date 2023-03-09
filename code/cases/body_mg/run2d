@@ -1,11 +1,10 @@
-#!/bin/bash -eu
+#!/bin/sh -eu
 
 : ${force=1}
 : ${extra=}
 : ${case=1}
 : ${body=circle}
 : ${lamb=1}
-: ${blend=1}
 : ${nimp=512}
 : ${gpus=0}
 : ${opt=lbfgsb}
@@ -29,10 +28,9 @@ run () {
 
 ext="--dim 2 --double 1"
 
-name=${body}_blend${blend}_lamb${lamb}
+name=${body}
 
 ext="$ext --body $body"
-ext="$ext --blend $blend"
 ext="$ext --optimizer $opt"
 
 refdir=ref_${name}

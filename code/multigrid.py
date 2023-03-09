@@ -1217,60 +1217,179 @@ class SparseOperator:
 class MultigridDecomp:
 
     @staticmethod
-    def interp_field(u, rep=1, mod=None):
+    def interp_node_field(u, depth=1, mod=None, method=None):
         dim = len(u.shape)
-        if rep == 0:
+        if method is None:
+            method = 'conv' if dim <= 3 else 'roll'
+        if depth == 0:
             return u
 
         def term(*dd):
             dd = [tuple(-v for v in d) for d in dd]
             return sum(mod.roll(u, d, range(dim)) for d in dd) / len(dd)
 
-        if dim == 3:
-            u000 = u
-            u100 = term((0, 0, 0), (1, 0, 0))
-            u010 = term((0, 0, 0), (0, 1, 0))
-            u001 = term((0, 0, 0), (0, 0, 1))
-            u110 = term((0, 0, 0), (0, 1, 0), (1, 0, 0), (1, 1, 0))
-            u011 = term((0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1))
-            u101 = term((0, 0, 0), (1, 0, 0), (0, 0, 1), (1, 0, 1))
-            u111 = term((0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1), \
-                        (1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1))
-            uu = [u000, u001, u010, u011, u100, u101, u110, u111]
-            u = mod.batch_to_space(uu,
-                                   block_shape=[2] * dim,
-                                   crops=[[0, 1]] * dim)[0]
-        elif dim == 2:
-            u00 = u
-            u01 = term((0, 0), (0, 1))
-            u10 = term((0, 0), (1, 0))
-            u11 = term((0, 0), (0, 1), (1, 0), (1, 1))
-            uu = [u00, u01, u10, u11]
-            u = mod.batch_to_space(uu,
-                                   block_shape=[2] * dim,
-                                   crops=[[0, 1]] * dim)[0]
-        elif dim == 1:
-            u0 = u
-            u1 = term((0, ), (1, ))
-            uu = [u0, u1]
-            u = mod.batch_to_space(uu,
-                                   block_shape=[2] * dim,
-                                   crops=[[0, 1]] * dim)[0]
+        if method == 'manual':
+            if dim == 3:
+                u000 = u
+                u100 = term((0, 0, 0), (1, 0, 0))
+                u010 = term((0, 0, 0), (0, 1, 0))
+                u001 = term((0, 0, 0), (0, 0, 1))
+                u110 = term((0, 0, 0), (0, 1, 0), (1, 0, 0), (1, 1, 0))
+                u011 = term((0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1))
+                u101 = term((0, 0, 0), (1, 0, 0), (0, 0, 1), (1, 0, 1))
+                u111 = term((0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1), \
+                            (1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1))
+                uu = [u000, u001, u010, u011, u100, u101, u110, u111]
+            elif dim == 2:
+                u00 = u
+                u01 = term((0, 0), (0, 1))
+                u10 = term((0, 0), (1, 0))
+                u11 = term((0, 0), (0, 1), (1, 0), (1, 1))
+                uu = [u00, u01, u10, u11]
+            elif dim == 1:
+                u0 = u
+                u1 = term((0, ), (1, ))
+                uu = [u0, u1]
+            else:
+                raise NotImplementedError(
+                    'Expected dim=1,2,3, got {:}'.format(dim))
+            res = mod.batch_to_space(uu,
+                                     block_shape=[2] * dim,
+                                     crops=[[0, 1]] * dim)[0]
+        elif method == 'conv':
+            assert dim <= 3, "method={} requires dim=1,2,3".format(method)
+            wone = np.array([1, 2, 1], dtype=float)
+            # Convolution weights, tensor product of `wone`.
+            w = wone
+            for _ in range(dim - 1):
+                w = np.kron(wone, w[..., None])
+            w *= 0.5**dim
+            w = mod.cast(mod.reshape(w, w.shape + (1, 1)), u.dtype)
+            shape = u.shape
+            # Shape of result plus two in each direction.
+            oshape = tuple((s) * 2 + 1 for s in shape)
+            u = mod.reshape(u, (1, ) + shape + (1, ))
+            res = mod.nn.conv_transpose(u,
+                                        filters=w,
+                                        output_shape=(1, ) + oshape + (1, ),
+                                        strides=2,
+                                        padding='VALID')
+            # Cut one point from each edge.
+            res = res[(0, ) + (slice(1, -1, None), ) * dim + (0, )]
+        elif method == 'roll':
+            ddw = np.meshgrid(*[[0, 1]] * dim, indexing='ij')
+            ddw = np.reshape(ddw, (dim, -1)).T
+            uu = [term(*[rw for rw in ddw if np.all(rw <= dw)]) for dw in ddw]
+            res = mod.batch_to_space(uu,
+                                     block_shape=[2] * dim,
+                                     crops=[[0, 1]] * dim)[0]
         else:
-            raise NotImplemented('Expected dim=1,2,3, got ' + int(dim))
-        return MultigridDecomp.interp_field(u, rep - 1, mod=mod)
+            raise NotImplementedError('Unknown method=' + method)
+        return MultigridDecomp.interp_field(res, depth - 1, mod=mod)
 
     @staticmethod
-    def weights_to_fields(uw, nnw, mod):
+    def interp_cell_field(u, depth=1, mod=None, method=None):
+        dim = len(u.shape)
+        if method is None:
+            method = 'conv' if dim <= 3 else 'roll'
+        if depth == 0:
+            return u
+
+        def term(*dd, ww=None):
+            assert len(ww) == len(dd)
+            dd = [tuple(-v for v in d) for d in dd]
+            return sum(w * mod.roll(u, d, range(dim))
+                       for d, w in zip(dd, ww)) / sum(ww)
+
+        # Add halo cells with linear extrapolation.
+        ur = mod.pad(u, paddings=[[1, 1]] * dim, mode='REFLECT')
+        us = mod.pad(u, paddings=[[1, 1]] * dim, mode='SYMMETRIC')
+        u = 2 * us - ur
+
+        if method == 'manual':
+            if dim == 2:
+                uu = [
+                    term((0, 0), (0, 1), (1, 0), (1, 1), ww=ww) for ww in [
+                        [9, 3, 3, 1],
+                        [3, 9, 1, 3],
+                        [3, 1, 9, 3],
+                        [1, 3, 3, 9],
+                    ]
+                ]
+            elif dim == 1:
+                u0 = term((0, ), (1, ), ww=(3, 1))
+                u1 = term((0, ), (1, ), ww=(1, 3))
+                uu = [u0, u1]
+            else:
+                raise NotImplementedError(
+                    'Expected dim=1,2, got {:}'.format(dim))
+            res = mod.batch_to_space(uu,
+                                     block_shape=[2] * dim,
+                                     crops=[[1, 3]] * dim)[0]
+        elif method == 'conv':
+            assert dim <= 3, "method={} requires dim=1,2,3".format(method)
+            wone = np.array([1, 3, 3, 1], dtype=float)
+            # Convolution weights, tensor product of `wone`.
+            w = wone
+            for _ in range(dim - 1):
+                w = np.kron(wone, w[..., None])
+            w *= 0.25**dim
+            w = mod.cast(mod.reshape(w, w.shape + (1, 1)), u.dtype)
+            shape = u.shape
+            # Shape of result plus two in each direction.
+            oshape = tuple((s + 1) * 2 for s in shape)
+            u = mod.reshape(u, (1, ) + shape + (1, ))
+            res = mod.nn.conv_transpose(u,
+                                        filters=w,
+                                        output_shape=(1, ) + oshape + (1, ),
+                                        strides=2,
+                                        padding='VALID')
+            # Cut one point from each edge.
+            res = res[(0, ) + (slice(3, -3, None), ) * dim + (0, )]
+        elif method == 'roll':
+            ddw = np.meshgrid(*[[0, 1]] * dim, indexing='ij')
+            ddw = np.reshape(ddw, (dim, -1)).T
+            uu = [
+                term(*ddw, ww=[3**(dim - sum(abs(rw - dw))) for rw in ddw])
+                for dw in ddw
+            ]
+            res = mod.batch_to_space(uu,
+                                     block_shape=[2] * dim,
+                                     crops=[[1, 3]] * dim)[0]
+        else:
+            raise NotImplementedError('Unknown method=' + method)
+        return MultigridDecomp.interp_cell_field(res, depth - 1, mod=mod)
+
+    @staticmethod
+    def interp_field(u, depth=1, mod=None, method=None, cell=False):
+        if cell:
+            return MultigridDecomp.interp_cell_field(u,
+                                                     depth=depth,
+                                                     mod=mod,
+                                                     method=method)
+        else:
+            return MultigridDecomp.interp_node_field(u,
+                                                     depth=depth,
+                                                     mod=mod,
+                                                     method=method)
+
+    @staticmethod
+    def weights_to_fields(uw, nnw, mod, method=None, factors=None, cell=False):
         uu = []
         s = 0
-        for nw in nnw:
-            uu.append(mod.reshape(uw[s:s + np.prod(nw)], nw))
+        if factors is None:
+            factors = [1] * len(nnw)
+        for nw, f in zip(nnw, factors):
+            f = mod.cast(f, uw.dtype)
+            uu.append(mod.reshape(uw[s:s + np.prod(nw)], nw) * f)
             s += np.prod(nw)
 
         return [
-            MultigridDecomp.interp_field(u, i, mod=mod)
-            for i, u in enumerate(uu)
+            MultigridDecomp.interp_field(u,
+                                         i,
+                                         mod=mod,
+                                         method=method,
+                                         cell=cell) for i, u in enumerate(uu)
         ]
 
     @staticmethod
@@ -1287,11 +1406,14 @@ class MultigridDecomp:
         return mod.concat(res, -1)
 
     @staticmethod
-    def weights_to_field(uw, nnw, mod):
+    def weights_to_field(uw, nnw, mod, method=None, factors=None, cell=False):
         uu = []
         s = 0
-        for nw in nnw:
-            uu.append(mod.reshape(uw[s:s + np.prod(nw)], nw))
+        if factors is None:
+            factors = [1] * len(nnw)
+        for nw, f in zip(nnw, factors):
+            f = mod.cast(f, uw.dtype)
+            uu.append(mod.reshape(uw[s:s + np.prod(nw)], nw) * f)
             s += np.prod(nw)
 
         res = None
@@ -1299,5 +1421,6 @@ class MultigridDecomp:
             if res is None:
                 res = u
                 continue
-            res = MultigridDecomp.interp_field(res, mod=mod) + u
+            res = MultigridDecomp.interp_field(
+                res, mod=mod, method=method, cell=cell) + u
         return res
