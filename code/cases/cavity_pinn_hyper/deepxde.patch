@@ -1,0 +1,20 @@
+diff --git a/deepxde/optimizers/tensorflow_compat_v1/scipy_optimizer.py b/deepxde/optimizers/tensorflow_compat_v1/scipy_optimizer.py
+index e7b12c3..3f0c0a6 100644
+--- a/deepxde/optimizers/tensorflow_compat_v1/scipy_optimizer.py
++++ b/deepxde/optimizers/tensorflow_compat_v1/scipy_optimizer.py
+@@ -370,10 +370,11 @@ class ScipyOptimizerInterface(ExternalOptimizerInterface):
+                     raise ValueError(
+                         "Bounds must be set using the var_to_bounds argument"
+                     )
+-                raise ValueError(
+-                    "Optimizer keyword arg '{}' is set "
+-                    "automatically and cannot be injected manually".format(kwarg)
+-                )
++                if kwarg is not "callback":
++                    raise ValueError(
++                        "Optimizer keyword arg '{}' is set "
++                        "automatically and cannot be injected manually".format(kwarg)
++                    )
+ 
+         minimize_kwargs.update(optimizer_kwargs)
+ 
