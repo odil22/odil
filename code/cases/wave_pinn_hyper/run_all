@@ -1,0 +1,24 @@
+#!/bin/sh -eu
+
+run () {
+  outdir=$1
+  extra=$2
+  if [ -d "$outdir" ] ; then
+    echo "skip existing '$outdir'"
+    return
+  fi
+  srun -n 12 ./vary.py --outdir "${outdir}" --extra "$extra"
+}
+
+adam="--optimizer adamn --lr 0.005"
+
+group () {
+  run out_${1}_baseline " $2"
+  run out_${1}_norm "--normalize 1 $2"
+  run out_${1}_norm_glorot "--normalize 1 --nn_initializer glorot $2"
+}
+
+group "nosymm_lbfgs" ""
+group "nosymm_adam" "$adam"
+group "symm_lbfgs" "--ref symm"
+group "symm_adam" "--ref symm $adam"

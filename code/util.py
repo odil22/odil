@@ -189,6 +189,19 @@ def add_arguments(parser):
                         type=int,
                         default=50,
                         help="History size for L-BFGS")
+    parser.add_argument('--adam_epsilon',
+                        type=float,
+                        help="Parameter epsilon in Adam")
+    parser.add_argument('--adam_beta_1',
+                        type=float,
+                        help="Parameter beta_1 in Adam")
+    parser.add_argument('--adam_beta_2',
+                        type=float,
+                        help="Parameter beta_2 in Adam")
+    parser.add_argument('--multigrid',
+                        type=int,
+                        default=0,
+                        help="Use multigrid decomposition")
     parser.add_argument('--mg_interp',
                         type=str,
                         default='conv',
@@ -214,6 +227,16 @@ def add_arguments(parser):
                         help="Factor for the diagonal update"
                         "for each step of Jacobi optimizer. "
                         "Increase above 1 for more weight to recent values")
+    parser.add_argument('--jac_epsilon',
+                        type=float,
+                        default=1e-8,
+                        help="Parameter epsilon in Jacobi optimizer. "
+                        "Added to the diagonal to avoid division by zero")
+    parser.add_argument('--nn_initializer',
+                        type=str,
+                        default='legacy',
+                        choices=['legacy', 'glorot', 'lecun', 'he'],
+                        help="Initializer for weights of neural networks")
 
 
 def optimize_newton(args, problem, state, callback):
@@ -254,15 +277,25 @@ def optimize_opt(args, optname, problem, state, callback, **kwargs):
         problem.domain.assign_active_state(state, s)
         loss, grads, wgrads, loss_split = problem.eval_loss_grad(state,
                                                                  epoch=epoch)
-        last_residual = [v**0.5 for v in loss_split]
+        # FIXME: Pass Problem.Raw here.
+        last_residual = [v**0.5 if v >= 0 else v for v in loss_split]
         g = problem.pack_fields(grads)
         wg = problem.pack_weights(wgrads)
         g = tf.concat([g, wg], axis=-1)
         return loss, g, last_residual
 
     packed = problem.pack_state(state)
+
+    # Custom parameters.
     if args.bfgs_m is not None:
         kwargs['m'] = args.bfgs_m
+    if args.adam_epsilon is not None:
+        kwargs['epsilon'] = args.adam_epsilon
+    if args.adam_beta_1 is not None:
+        kwargs['beta_1'] = args.adam_beta_1
+    if args.adam_beta_2 is not None:
+        kwargs['beta_2'] = args.adam_beta_2
+
     opt = optimizer.make_optimizer(optname,
                                    dtype=problem.domain.dtype,
                                    **kwargs)
@@ -284,8 +317,6 @@ def optimize_opt(args, optname, problem, state, callback, **kwargs):
     printlog(info)
 
 
-
-
 def optimize_jacobi(args, problem, state, callback):
     opt = optimizer.Optimizer(name='jacobi', displayname='Jacobi')
     printlog("Running {} optimizer".format(opt.displayname))
@@ -295,6 +326,7 @@ def optimize_jacobi(args, problem, state, callback):
     nsmp0 = args.jac_nsmp0
     nsmp1 = args.jac_nsmp1
     factor = args.jac_factor
+    epsilon = args.jac_epsilon
     diag = problem.eval_diag(state, epoch=args.epoch_start, nsmp=nsmp0)
     ntotal = nsmp0
 
@@ -315,11 +347,12 @@ def optimize_jacobi(args, problem, state, callback):
         g = problem.pack_fields(grads)
         wg = problem.pack_weights(wgrads)
         g = tf.concat([g, wg], axis=-1)
-        dpacked = -(g / diag) * (args.lr * 0.5)
+        dpacked = -(g / (diag + epsilon)) * (args.lr * 0.5)
 
-        # Compute loss and residuals with initial state, to be used by callback.
         opt.last_loss = loss.numpy()
-        opt.last_residual = [v.numpy()**0.5 for v in loss_split]
+        loss_split = [v.numpy() for v in loss_split]
+        # FIXME: Pass Problem.Raw here.
+        opt.last_residual = [v**0.5 if v >= 0 else v for v in loss_split]
         callback(packed, epoch, dhistory=dhistory, opt=opt)
         if epoch == args.epochs:
             break

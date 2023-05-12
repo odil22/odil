@@ -1,14 +1,13 @@
-#!/usr/bin/env python3
-
-import scipy.sparse
 import numpy as np
+import scipy
+import scipy.sparse
 import os
 import math
 from util import TIME, TIMECLEAR, Timer
 import pickle
 from argparse import Namespace
 import util_min
-from multigrid import Multigrid, MultigridOp, SparseOperator, StencilDict
+from multigrid import Multigrid, MultigridDecomp
 
 from tfwrap import tf
 
@@ -16,17 +15,38 @@ from tfwrap import tf
 class Domain:
 
     def __init__(
-            self,
-            ndim=None,
-            lower=0.,
-            upper=1.,
-            shape=None,
-            varnames=['x', 'y', 'z'],  # Independent variables.
-            fieldnames=[],  # Unknown fields.
-            neuralnets=dict(),  # Neural networks dict(name:layers)
-            frozen_weights=[],
-            frozen_fields=[],
-            dtype=np.float64):
+        self,
+        ndim=None,
+        lower=0.,
+        upper=1.,
+        shape=None,
+        varnames=['x', 'y', 'z'],  # Independent variables.
+        fieldnames=[],  # Unknown fields.
+        neuralnets=dict(),  # Neural networks dict(name:layers)
+        frozen_weights=[],
+        frozen_fields=[],
+        dtype=np.float64,
+        multigrid=False,
+        mg_nlvl=None,
+        mg_factors=None,
+        mg_axes=None,
+        mg_interp=None,
+        mg_cell=False,
+    ):
+        '''
+        multigrid: `bool`
+            Use multigrid decomposition for fields in `fieldnames`.
+        mg_nlvl: `int`
+            Number of multigrid levels. Defaults to maximum possible.
+        mg_factors: `list` of `int`
+            Factors of each level. Defaults to ones.
+        mg_axes: `list` of `bool`
+            Axes in which to use multigrid decomposition. Defaults to all.
+        mg_interp: `str`
+            Multigrid interpolation method. See `MultigridDecomp.interp_field()`.
+        mg_cell: `bool`
+            Use cell-based interpolation if True, otherwise node-based.
+        '''
         if ndim is None:
             ndim = len(varnames)
         self.ndim = ndim
@@ -35,9 +55,43 @@ class Domain:
         self.lower = np.ones(ndim, dtype=dtype) * lower
         self.upper = np.ones(ndim, dtype=dtype) * upper
         self.varnames = varnames[:ndim]
-        self.fieldnames = fieldnames
         self.dtype = dtype
         self.shape = shape
+
+        # Multigrid decomposition
+        self.multigrid = multigrid
+        if multigrid:
+            self.mg_factors = mg_factors
+            mg_axes = [True] * ndim if mg_axes is None else mg_axes
+            nlvl_max = min(
+                round(np.log2(n if mg_cell else n - 1)) if ax else max(shape)
+                for n, ax in zip(shape, mg_axes))
+            mg_nlvl = nlvl_max if mg_nlvl is None else min(mg_nlvl, nlvl_max)
+            self.mg_nlvl = mg_nlvl
+            self.mg_cell = mg_cell
+            self.mg_nnw = [
+                tuple(((n >> lvl) if mg_cell else ((n - 1) >> lvl) +
+                       1) if ax else n for n, ax in zip(shape, mg_axes))
+                for lvl in range(self.mg_nlvl)
+            ]
+            MultigridDecomp.check_nnw(self.mg_nnw,
+                                      use_axes=mg_axes,
+                                      cell=self.mg_cell)
+            self.mg_axes = mg_axes
+            self.mg_interp = mg_interp
+
+        mg_fieldnames = []
+        if multigrid:
+            netsize = sum([np.prod(nw) for nw in self.mg_nnw])
+            for name in fieldnames:
+                if name in neuralnets:
+                    raise RuntimeError(
+                        "Name collision of field and neuralnet '{}'".format(
+                            name))
+                neuralnets[name] = [0, netsize]
+                mg_fieldnames.append(name)
+        self.fieldnames = fieldnames
+        self.mg_fieldnames = mg_fieldnames
         self.neuralnets = neuralnets
         self.frozen_weights = frozen_weights
         # Names of active weights.
@@ -88,7 +142,7 @@ class Domain:
         return res
 
     def cell_center_by_dim(self, i):
-        #TODO Only create meshgrid for one component.
+        # TODO Only create meshgrid for one component.
         return self.cell_center_all()[i]
 
     def cell_center_by_name(self, name):
@@ -113,7 +167,7 @@ class Domain:
         return res
 
     def cell_node_by_dim(self, i):
-        #TODO Only create meshgrid for one component.
+        # TODO Only create meshgrid for one component.
         return self.cell_node_all()[i]
 
     def cell_node_by_name(self, name):
@@ -129,14 +183,14 @@ class Domain:
         return np.meshgrid(*[np.arange(s) for s in self.shape], indexing='ij')
 
     def cell_index_by_dim(self, i):
-        #TODO Only create meshgrid for one component.
+        # TODO Only create meshgrid for one component.
         return self.cell_index_all()[i]
 
     def cell_index_by_name(self, name):
         '''
         Returns cell index in direction `name` (e.g. 'ix').
         '''
-        #TODO Only create meshgrid for one component.
+        # TODO Only create meshgrid for one component.
         names = ['i' + n for n in self.varnames]
         if name in names:
             i = names.index(name)
@@ -148,7 +202,7 @@ class Domain:
                            indexing='ij')
 
     def node_index_by_dim(self, i):
-        #TODO Only create meshgrid for one component.
+        # TODO Only create meshgrid for one component.
         return self.node_index_all()[i]
 
     # Aliases consistent with Context.
@@ -213,6 +267,68 @@ class Domain:
             for i in range(len(src.weights[name])):
                 dst.weights[name][i].assign(src.weights[name][i])
 
+    def multigrid_to_field(self,
+                           uw,
+                           mod=tf,
+                           factors=None,
+                           use_axes=None,
+                           method=None,
+                           cell=None):
+        '''
+        Converts multigrid components to field.
+        uw: `ndarray`
+            Multigrid components on levels `self.mg_nnw`.
+        '''
+        factors = self.mg_factors if factors is None else factors
+        use_axes = self.mg_axes if use_axes is None else use_axes
+        method = self.mg_interp if method is None else method
+        cell = self.mg_cell if cell is None else cell
+        u = MultigridDecomp.weights_to_field(uw,
+                                             self.mg_nnw,
+                                             mod,
+                                             factors=factors,
+                                             use_axes=use_axes,
+                                             method=method,
+                                             cell=cell)
+
+        return u
+
+    def field_to_multigrid(self, u, mod=tf, factors=None):
+        '''
+        Converts field to multigrid components.
+        u: `ndarray`
+            Field on the fine grid `self.mg_nnw[0]`.
+        '''
+        factors = self.mg_factors if factors is None else factors
+        uw = MultigridDecomp.field_to_weights(u,
+                                              self.mg_nnw,
+                                              mod=mod,
+                                              factors=factors)
+        return uw
+
+    def state_to_field(self, key, state, mod=tf):
+        if key in state.weights:
+            uw = state.weights[key][1]
+            u = self.multigrid_to_field(uw, mod=mod)
+        else:
+            u = state.fields[key]
+        return u
+
+    def add_field_to_state(self, u, key, state, mod=tf):
+        if key in state.weights:
+            uw = self.field_to_multigrid(u, mod=mod)
+            state_uw = state.weights[key][1]
+            if hasattr(state_uw, "assign_add"):
+                state_uw.assign_add(uw)
+            else:
+                state_uw += uw
+        else:
+            state_u = state.fields[key]
+            if hasattr(state_u, "assign_add"):
+                state_u.assign_add(u)
+            else:
+                state_u += u
+
 
 class State:
 
@@ -235,7 +351,7 @@ def convert_to_tf_variable(domain, state):
             ]
 
 
-def eval_neural_net(wb, *uu):
+def eval_neural_net(wb, *uu, func_in=None, func_out=None):
     '''
     Evaluates a fully connected neural network.
     wb: `list`
@@ -245,9 +361,9 @@ def eval_neural_net(wb, *uu):
         The number of arrays `len(uu)` must coincide with the number
         of inputs of the neural network `wb[0].shape[0]`.
     Returns:
-        Output array or a list of them if multiple outputs are expected.
+        List of output arrays.
         The output arrays have the same shape as the input arrays.
-        The number of output arrays  conincides with the number of
+        The number of output arrays conincides with the number of
         outputs of the neural network `wb[-2].shape[1]`.
     '''
 
@@ -260,6 +376,8 @@ def eval_neural_net(wb, *uu):
     if ni:  # Neural network with inputs.
         shape = uu[0].shape
         n = len(wb) // 2
+        if func_in is not None:
+            uu = func_in(*uu)
         uu = [tf.reshape(u, (-1, )) for u in uu]
         u = tf.transpose(tf.stack(uu, 0))
         for i in range(n):
@@ -272,8 +390,8 @@ def eval_neural_net(wb, *uu):
         u = tf.transpose(u)
         uu = tf.reshape(u, (no, ) + shape)
         uu = [uu[i] for i in range(no)]
-        if no == 1:
-            uu = uu[0]
+        if func_out is not None:
+            uu = func_out(*uu)
         return uu
     # Neural network without inputs.
     assert len(wb) == 2 and wb[0].shape[0] == 0 and wb[1].shape != 0, \
@@ -284,14 +402,19 @@ def eval_neural_net(wb, *uu):
 
 class NeuralNet:
 
-    def __init__(self, weights, *inputs):
+    def __init__(self, weights, *inputs, func_in=None, func_out=None):
         self.weights = weights
+        self.func_in = func_in
+        self.func_out = func_out
         self.inputs = [
             x if tf.is_tensor(x) else tf.constant(x) for x in inputs
         ]
 
     def __call__(self, *deriv):
-        f = eval_neural_net(self.weights, *self.inputs)
+        f = eval_neural_net(self.weights,
+                            *self.inputs,
+                            func_in=self.func_in,
+                            func_out=self.func_out)
         assert len(deriv) == 0 or len(deriv) == len(self.inputs)
 
         def grad(f):
@@ -303,8 +426,6 @@ class NeuralNet:
         if not isinstance(f, list):
             f = [f]
         res = [grad(f[i]) for i in range(len(f))]
-        if len(res) == 1:
-            res = res[0]
         return res
 
 
@@ -327,9 +448,15 @@ class Context:
         self.field_desc = field_desc
         self.state_fields = state_fields
         self.state_weights = state_weights
+        self.mgfields = dict()
         self.split_shifts = split_shifts
         self.epoch = epoch
         self.extra = extra
+        self.dtype = domain.dtype
+
+    def cast(self, value, dtype=None):
+        dtype = self.dtype if dtype is None else dtype
+        return tf.cast(value, dtype)
 
     def size(self, i):
         domain = self.domain
@@ -363,7 +490,12 @@ class Context:
 
     # TODO: Add `shift` parameter to cell_index(), cell_center()
 
-    def neural_net(self, name, *inputs, freeze=False):
+    def neural_net(self,
+                   name,
+                   *inputs,
+                   freeze=False,
+                   func_in=None,
+                   func_out=None):
         try:
             wb = self.state_weights[name]  # Weights and biases interleaved.
         except KeyError:
@@ -371,51 +503,69 @@ class Context:
                 "Weights with name '{:}' not found in domain.neuralnets".
                 format(name))
 
-        return NeuralNet(wb, *inputs)
+        return NeuralNet(wb, *inputs, func_in=func_in, func_out=func_out)
 
     def field(self, name, *shift, freeze=False):
         domain = self.domain
         szero = (0, ) * domain.ndim
-        if len(shift) == 0:
-            shift = szero
+        assert len(shift) <= domain.ndim, "Shift is too long {:}".format(shift)
+        shift = shift + (0, ) * (domain.ndim - len(shift))
+
+        # Custom fields.
         u = domain.custom_by_name(name)
         if u is not None:
             return u
+
+        # Multigrid fields.
+        if name in domain.mg_fieldnames:
+            if (name, shift) in self.mgfields:
+                u = self.mgfields[(name, shift)]
+            else:
+                if (name, szero) in self.mgfields:
+                    u = self.mgfields[(name, szero)]
+                else:
+                    uw = self.neural_net(name)()[0]
+                    u = domain.multigrid_to_field(uw, mod=tf)
+                    self.mgfields[(name, szero)] = u
+                if shift != szero:
+                    u = tf.roll(u, np.negative(shift), range(domain.ndim))
+                    self.mgfields[(name, shift)] = u
+            return u
+
+        # Regular grid fields.
         try:
             j = domain.fieldnames.index(name)
         except ValueError:
             raise ValueError("Unknown field name '" + name + "'")
+
+        if freeze:
+            return tf.roll(tf.stop_gradient(self.state_fields[name]),
+                           np.negative(shift), range(domain.ndim))
+
         if self.split_shifts:
-            # New field argument is created for each shift.
-            if freeze:
-                u = tf.roll(self.state_fields[name], np.negative(shift),
-                            range(domain.ndim))
-            elif (j, shift) in self.field_desc:
+            # New field argument created for each shift.
+            if (j, shift) in self.field_desc:
                 u = self.args[self.field_desc.index((j, shift))]
             else:
                 u = tf.roll(self.state_fields[name], np.negative(shift),
                             range(domain.ndim))
                 self.args.append(u)
                 self.field_desc.append((j, shift))
+            return u
         else:
-            # One field argument is reused for all shifted fields.
-            if freeze:
-                u = tf.roll(self.state_fields[name], np.negative(shift),
-                            range(domain.ndim))
+            # One field argument reused for all shifted fields.
+            if (j, szero) in self.field_desc:
+                uc = self.args[self.field_desc.index((j, szero))]
             else:
-                if (j, szero) in self.field_desc:
-                    uc = self.args[self.field_desc.index((j, szero))]
-                else:
-                    uc = self.state_fields[name]
-                    self.args.append(uc)
-                    self.field_desc.append((j, szero))
-                u = tf.roll(uc, np.negative(shift), range(domain.ndim))
-        return u
+                uc = self.state_fields[name]
+                self.args.append(uc)
+                self.field_desc.append((j, szero))
+            return tf.roll(uc, np.negative(shift), range(domain.ndim))
 
 
 class Problem:
 
-    def __init__(self, operator, domain, extra=None):
+    def __init__(self, operator, domain, extra=None, nn_initializer='legacy'):
         '''
         operator: callable(mod, ctx)
             Discrete operator returning fields on grid.
@@ -430,6 +580,7 @@ class Problem:
         self.timer_total = Timer()
         self.timer_last = Timer()
         self.extra = extra
+        self.nn_initializer = nn_initializer
 
     def _eval_grad0(self, state_fields, state_weights, epoch):
         domain = self.domain
@@ -468,6 +619,11 @@ class Problem:
     def _eval_grad(self, state_fields, state_weights, epoch):
         return self._eval_grad0(state_fields, state_weights, epoch)
 
+    class Raw:
+
+        def __init__(self, value):
+            self.value = value
+
     @tf.function(jit_compile=False)
     def _eval_loss(self, state_fields, state_weights, epoch):
         domain = self.domain
@@ -487,11 +643,34 @@ class Problem:
             ff = self.operator(tf, ctx)
             if not isinstance(ff, tuple) and not isinstance(ff, list):
                 ff = (ff, )
-            loss_split = [tf.reduce_mean(tf.square(f)) for f in ff]
+            loss_split = [
+                tf.reduce_mean(f.value)
+                if isinstance(f, Problem.Raw) else tf.reduce_mean(tf.square(f))
+                for f in ff
+            ]
             loss = sum(loss_split)
         grads = tape.gradient(loss, args)
         wgrads = tape.gradient(loss, wargs)
         return loss, grads, field_desc, wgrads, loss_split
+
+    @tf.function(jit_compile=False)
+    def _eval_operator(self, state_fields, state_weights, epoch):
+        domain = self.domain
+        args = []  # Field arguments for which gradients are computed.
+        field_desc = []  # Index in `fieldnames` of the field argument.
+        ctx = Context(domain,
+                      args,
+                      field_desc,
+                      state_fields,
+                      state_weights,
+                      epoch=epoch,
+                      extra=self.extra,
+                      split_shifts=False)
+        ff = self.operator(tf, ctx)
+        if not isinstance(ff, tuple) and not isinstance(ff, list):
+            ff = (ff, )
+        ff = [f.value if isinstance(f, Problem.Raw) else f for f in ff]
+        return ff
 
     @tf.function(jit_compile=False)
     def _eval_diag_tf(self, state_fields, state_weights, epoch):
@@ -507,13 +686,13 @@ class Problem:
                           state_fields,
                           state_weights,
                           epoch=epoch,
-                          extra=None,
+                          extra=self.extra,
                           split_shifts=False)
             ff = self.operator(tf, ctx)
             if not isinstance(ff, tuple) and not isinstance(ff, list):
                 ff = (ff, )
             lossn = sum([
-                tf.reduce_sum(
+                f.value if isinstance(f, Problem.Raw) else tf.reduce_sum(
                     f * tf.random.normal(f.shape, dtype=domain.dtype)) /
                 (tf.cast(tf.size(f), domain.dtype)**0.5) for f in ff
             ])
@@ -526,7 +705,7 @@ class Problem:
             res[domain.fieldnames[i]] = g
         for name in domain.fieldnames:
             if name not in res:
-                g[name] = tf.zeros(domain.shape, dtype=domain.dtype)
+                res[name] = tf.zeros(domain.shape, dtype=domain.dtype)
 
         resw = dict()
         for i, name in enumerate(domain.aweights):
@@ -623,11 +802,23 @@ class Problem:
         return state
 
     def init_missing(self, state):
+        nn_initializer = self.nn_initializer
+        def nn_scale(ni, no):
+            if nn_initializer == 'legacy':
+                return np.sqrt(1. / ni)
+            elif nn_initializer == 'glorot':
+                return np.sqrt(6. / (ni + no))
+            elif nn_initializer == 'lecun':
+                return np.sqrt(3. / ni)
+            elif nn_initializer == 'he':
+                return np.sqrt(6. / ni)
+            raise ValueError('Unknown initializer=' + nn_initializer)
         domain = self.domain
+        dtype = domain.dtype
         for name in domain.fieldnames:
             if name not in state.fields:
                 # Initialize fields with zeros by defult.
-                state.fields[name] = tf.zeros(domain.shape, dtype=domain.dtype)
+                state.fields[name] = tf.zeros(domain.shape, dtype=dtype)
         for name, layers in domain.neuralnets.items():
             assert layers[-1], \
                 "Neural network '{}' must have output, " \
@@ -637,16 +828,16 @@ class Problem:
                 for ni, no in zip(layers[:-1], layers[1:]):
                     # Weights
                     if ni:
-                        scale = 1 / math.sqrt(ni)
+                        scale = nn_scale(ni, no)
                         w = tf.random.uniform((ni, no),
                                               -scale,
                                               scale,
-                                              dtype=domain.dtype)
+                                              dtype=dtype)
                     else:
-                        w = tf.zeros((ni, no), dtype=domain.dtype)
+                        w = tf.zeros((ni, no), dtype=dtype)
                     ww.append(w)
                     # Biases
-                    ww.append(tf.zeros(no, dtype=domain.dtype))
+                    ww.append(tf.zeros(no, dtype=dtype))
                 state.weights[name] = ww
             else:
                 ww = state.weights[name]
@@ -773,6 +964,13 @@ class Problem:
         self.timer_last = timer
 
         return loss, grads, wgrads, loss_split
+
+    def eval_operator(self, state, epoch=0):
+        domain = self.domain
+        self.init_missing(state)
+        epoch = tf.constant(epoch, dtype=domain.dtype)
+        ff = self._eval_operator(state.fields, state.weights, epoch)
+        return ff
 
 
 def checkpoint_save(state, path):

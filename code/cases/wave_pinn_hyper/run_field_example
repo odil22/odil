@@ -1,0 +1,22 @@
+#!/bin/sh -eu
+
+: ${N=25}
+: ${outdir=pinn_nosymm}
+export NOWARN=1
+
+run() {
+  if [ -d "$outdir" ] ; then
+    echo "skip existing '$outdir'"
+    return
+  fi
+  cmd="./wave.py --outdir $outdir --seed 5 \
+    --arch $N $N --Nci 512 --Ncb 256 \
+    --report_every 100 --history_every 100 --plot_every 1000 \
+    --solver pinn --epochs 5000 --optimizer lbfgsb"
+  cmd="$cmd $@"
+  echo "$cmd"
+  eval "$cmd"
+}
+
+outdir=out_pinn_nosymm run --ref nosymm
+outdir=out_pinn_symm run --ref symm

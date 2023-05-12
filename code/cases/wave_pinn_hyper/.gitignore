@@ -1,0 +1,5 @@
+*.pickle
+*.pdf
+out_*/
+data_*/
+*.log

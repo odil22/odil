@@ -223,7 +223,7 @@ class AdamOptimizer(Optimizer):
                 self.last_residual = model.last_residual
                 self.last_loss = model.last_loss
                 if epoch > 0 and callback:
-                    callback(model.x, epoch=epoch, opt=self)
+                    callback(model.x, epoch=model.epoch, opt=self)
 
         model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
                       run_eagerly=True)
@@ -252,13 +252,67 @@ class GdOptimizer(Optimizer):
             epoch_start=0,
             **kwargs):
 
-        x = x0 + 0
+        x = tf.identity(x0)
         for epoch in range(epoch_start + 1, epoch_start + epochs + 1):
             loss, grad, last_residual = loss_grad(x, epoch)
             x -= grad * lr
             self.evals += 1
             self.last_residual = [r.numpy() for r in last_residual]
             self.last_loss = loss.numpy()
+            if epoch > 0 and callback is not None:
+                callback(x, epoch=epoch, opt=self)
+
+        info = Namespace()
+        info.epochs = epochs
+        info.evals = self.evals
+        return x, info
+
+
+class AdamNativeOptimizer(Optimizer):
+
+    def __init__(self, dtype=None, **kwargs):
+        super().__init__(name="adamn", displayname="AdamNative", dtype=dtype)
+
+    def run(self,
+            x0,
+            loss_grad,
+            epochs=None,
+            callback=None,
+            lr=1e-3,
+            epoch_start=0,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-7,
+            **kwargs):
+        '''
+        Based on
+        https://github.com/keras-team/keras/blob/v2.12.0/keras/optimizers/adam.py
+        '''
+
+        dtype = self.dtype
+        lr = tf.cast(lr, dtype)
+        x = tf.identity(x0)
+        m = None
+        v = None
+        for epoch in range(epoch_start + 1, epoch_start + epochs + 1):
+            loss, grad, last_residual = loss_grad(x, epoch)
+            self.evals += 1
+            self.last_residual = [r.numpy() for r in last_residual]
+            self.last_loss = loss.numpy()
+
+            if m is None:
+                m = tf.zeros_like(grad)
+                v = tf.zeros_like(grad)
+
+            local_step = tf.cast(epoch - epoch_start, dtype)
+            beta_1_power = tf.pow(tf.cast(beta_1, dtype), local_step)
+            beta_2_power = tf.pow(tf.cast(beta_2, dtype), local_step)
+            alpha = lr * tf.sqrt(1 - beta_2_power) / (1 - beta_1_power)
+
+            m += (grad - m) * (1 - beta_1)
+            v += (tf.square(grad) - v) * (1 - beta_2)
+            x -= (m * alpha) / (tf.sqrt(v) + epsilon)
+
             if epoch > 0 and callback is not None:
                 callback(x, epoch=epoch, opt=self)
 
@@ -275,6 +329,8 @@ def make_optimizer(name, dtype=None, **kwargs):
         optimizer = LbfgsOptimizer(dtype=dtype, **kwargs)
     elif name == "adam":
         optimizer = AdamOptimizer(dtype=dtype, **kwargs)
+    elif name == "adamn":
+        optimizer = AdamNativeOptimizer(dtype=dtype, **kwargs)
     elif name == "gd":
         optimizer = GdOptimizer(dtype=dtype, **kwargs)
     else:
